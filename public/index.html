@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Consolidador de Incidentes</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+
+    <main class="shell">
+      <section id="loginCard" class="card card-login">
+        <div>
+          <p class="eyebrow">Monitoreo en tiempo real</p>
+          <h1>Consolidador de Incidentes</h1>
+          <p class="subtitle">Ingresa con correo y contraseña para ver alertas y gestionar usuarios.</p>
+        </div>
+
+        <form id="loginForm" class="stack">
+          <label>
+            Correo
+            <input type="email" name="email" placeholder="admin@notificaciones.local" required />
+          </label>
+          <label>
+            Contraseña
+            <input type="password" name="password" placeholder="********" required />
+          </label>
+          <button type="submit">Entrar</button>
+        </form>
+        <p id="loginError" class="error"></p>
+      </section>
+
+      <section id="appPanel" class="hidden">
+        <header class="topbar card">
+          <div>
+            <p class="eyebrow">Panel en vivo</p>
+            <h2>Incidentes Notificados</h2>
+          </div>
+          <div class="actions">
+            <span id="sessionInfo" class="badge"></span>
+            <button id="logoutBtn" class="ghost" type="button">Cerrar sesión</button>
+          </div>
+        </header>
+
+        <section class="grid">
+          <article class="card incidents-panel">
+            <h3>Incidentes</h3>
+            <p class="hint">Webhook de entrada: /api/webhook-incident</p>
+            <ul id="incidentList" class="incident-list"></ul>
+          </article>
+
+          <aside id="adminPanel" class="card hidden">
+            <h3>Administración de Usuarios</h3>
+            <form id="createUserForm" class="stack compact">
+              <label>Nombre <input type="text" name="username" required /></label>
+              <label>Correo <input type="email" name="email" required /></label>
+              <label>Contraseña <input type="password" name="password" required /></label>
+              <label>Número <input type="text" name="phone" placeholder="+56..." required /></label>
+              <label>
+                Rol
+                <select name="role">
+                  <option value="user">user</option>
+                  <option value="admin">admin</option>
+                </select>
+              </label>
+              <button type="submit">Crear usuario</button>
+            </form>
+            <p id="adminError" class="error"></p>
+            <p class="hint">Puedes editar o eliminar usuarios existentes.</p>
+            <ul id="userList" class="user-list"></ul>
+          </aside>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

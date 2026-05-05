@@ -1,0 +1,16 @@
+{
+  "name": "incident-consolidator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Consolidador de incidentes en tiempo real con login y administración de usuarios.",
+  "scripts": {
+    "dev": "npx netlify dev",
+    "build": "echo 'Static site ready'",
+    "start": "npx netlify dev"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

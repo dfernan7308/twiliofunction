@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "npm install": true,
+        "/^node --check twiliofunction\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

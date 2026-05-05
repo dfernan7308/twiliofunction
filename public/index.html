@@ -16,6 +16,9 @@
     <main class="shell">
       <section id="loginCard" class="card card-login">
         <div>
+          <div class="brand-lockup">
+            <img src="/cenco.png" alt="Cenco" class="logo" />
+          </div>
           <p class="eyebrow">Monitoreo en tiempo real</p>
           <h1>Consolidador de Incidentes</h1>
           <p class="subtitle">Ingresa con correo y contraseña para ver alertas y gestionar usuarios.</p>
@@ -37,9 +40,12 @@
 
       <section id="appPanel" class="hidden">
         <header class="topbar card">
-          <div>
+          <div class="topbar-title">
+            <img src="/cenco.png" alt="Cenco" class="logo logo-small" />
+            <div>
             <p class="eyebrow">Panel en vivo</p>
             <h2>Incidentes Notificados</h2>
+            </div>
           </div>
           <div class="actions">
             <span id="sessionInfo" class="badge"></span>
@@ -51,7 +57,68 @@
           <article class="card incidents-panel">
             <h3>Incidentes</h3>
             <p class="hint">Webhook de entrada: /api/webhook-incident</p>
+            <section class="incidents-toolbar">
+              <label>
+                Buscar
+                <input id="incidentSearchInput" type="text" placeholder="Titulo, usuario, numero, estado..." />
+              </label>
+              <label>
+                Agrupar por
+                <select id="incidentGroupBy">
+                  <option value="none">Sin agrupación</option>
+                  <option value="severity">Severidad</option>
+                  <option value="status">Estado</option>
+                  <option value="attended">Atención</option>
+                  <option value="user">Usuario enlazado</option>
+                  <option value="day">Día</option>
+                </select>
+              </label>
+              <label>
+                Estado
+                <input id="incidentStatusFilter" type="text" placeholder="OPEN, ACKNOWLEDGED..." />
+              </label>
+              <label>
+                Severidad
+                <input id="incidentSeverityFilter" type="text" placeholder="CRITICAL, WARNING..." />
+              </label>
+              <label>
+                Atendida
+                <select id="incidentAttendedFilter">
+                  <option value="all">Todas</option>
+                  <option value="yes">Sí</option>
+                  <option value="no">No</option>
+                </select>
+              </label>
+              <label>
+                Desde
+                <input id="incidentFromDate" type="datetime-local" />
+              </label>
+              <label>
+                Hasta
+                <input id="incidentToDate" type="datetime-local" />
+              </label>
+              <label>
+                Máximo por página
+                <select id="incidentPageSize">
+                  <option value="5">5</option>
+                  <option value="10" selected>10</option>
+                  <option value="15">15</option>
+                  <option value="20">20</option>
+                </select>
+              </label>
+              <div class="item-actions">
+                <button id="incidentClearFilters" class="ghost" type="button">Limpiar filtros</button>
+              </div>
+            </section>
             <ul id="incidentList" class="incident-list"></ul>
+            <div class="pagination-bar">
+              <span id="incidentPaginationInfo" class="hint">Mostrando 0 de 0</span>
+              <div class="item-actions">
+                <button id="incidentPrevPage" class="ghost" type="button">Anterior</button>
+                <span id="incidentPageIndicator" class="badge">Página 1/1</span>
+                <button id="incidentNextPage" class="ghost" type="button">Siguiente</button>
+              </div>
+            </div>
           </article>
 
           <aside id="adminPanel" class="card hidden">

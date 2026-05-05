@@ -70,6 +70,22 @@ body {
   margin: 8vh auto;
 }
 
+.brand-lockup {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.logo {
+  width: auto;
+  height: 44px;
+  object-fit: contain;
+}
+
+.logo-small {
+  height: 36px;
+}
+
 h1,
 h2,
 h3 {
@@ -158,6 +174,12 @@ button.danger {
   gap: 12px;
 }
 
+.topbar-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .actions {
   display: flex;
   align-items: center;
@@ -182,6 +204,22 @@ button.danger {
 
 .incidents-panel {
   min-height: 72vh;
+}
+
+.incidents-toolbar {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.incidents-toolbar label {
+  margin: 0;
+}
+
+.incidents-toolbar .item-actions {
+  margin: 0;
 }
 
 .incident-list,
@@ -215,6 +253,16 @@ button.danger {
   font-family: 'IBM Plex Mono', monospace;
 }
 
+.incident-group-header {
+  border: 1px dashed #7ab3dc88;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #eef7ff;
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: #26537a;
+}
+
 .severity-chip {
   background: #d7ebff;
   color: #1f568f;
@@ -229,6 +277,22 @@ button.danger {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.pagination-bar {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .inline-option {
@@ -266,6 +330,15 @@ button.danger {
 @media (max-width: 900px) {
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  .incidents-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .pagination-bar {
+    flex-direction: column;
+    align-items: flex-start;
   }
 
   .topbar {

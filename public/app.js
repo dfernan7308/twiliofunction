@@ -6,7 +6,18 @@ const state = {
   incidents: [],
   users: [],
   supabase: null,
-  realtimeChannel: null
+  realtimeChannel: null,
+  incidentView: {
+    search: '',
+    groupBy: 'none',
+    status: '',
+    severity: '',
+    attended: 'all',
+    from: '',
+    to: '',
+    perPage: 10,
+    page: 1
+  }
 };
 
 const elements = {
@@ -17,6 +28,19 @@ const elements = {
   sessionInfo: document.getElementById('sessionInfo'),
   logoutBtn: document.getElementById('logoutBtn'),
   incidentList: document.getElementById('incidentList'),
+  incidentSearchInput: document.getElementById('incidentSearchInput'),
+  incidentGroupBy: document.getElementById('incidentGroupBy'),
+  incidentStatusFilter: document.getElementById('incidentStatusFilter'),
+  incidentSeverityFilter: document.getElementById('incidentSeverityFilter'),
+  incidentAttendedFilter: document.getElementById('incidentAttendedFilter'),
+  incidentFromDate: document.getElementById('incidentFromDate'),
+  incidentToDate: document.getElementById('incidentToDate'),
+  incidentPageSize: document.getElementById('incidentPageSize'),
+  incidentClearFilters: document.getElementById('incidentClearFilters'),
+  incidentPrevPage: document.getElementById('incidentPrevPage'),
+  incidentNextPage: document.getElementById('incidentNextPage'),
+  incidentPageIndicator: document.getElementById('incidentPageIndicator'),
+  incidentPaginationInfo: document.getElementById('incidentPaginationInfo'),
   adminPanel: document.getElementById('adminPanel'),
   userInfoPanel: document.getElementById('userInfoPanel'),
   createUserForm: document.getElementById('createUserForm'),
@@ -40,6 +64,123 @@ const formatDate = (value) => {
   }
 
   return new Date(value).toLocaleString('es-CL');
+};
+
+const toTimestamp = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeFilterText = (value) => String(value || '').trim().toLowerCase();
+
+const syncIncidentViewFromControls = () => {
+  state.incidentView.search = normalizeFilterText(elements.incidentSearchInput.value);
+  state.incidentView.groupBy = String(elements.incidentGroupBy.value || 'none');
+  state.incidentView.status = normalizeFilterText(elements.incidentStatusFilter.value);
+  state.incidentView.severity = normalizeFilterText(elements.incidentSeverityFilter.value);
+  state.incidentView.attended = String(elements.incidentAttendedFilter.value || 'all');
+  state.incidentView.from = String(elements.incidentFromDate.value || '');
+  state.incidentView.to = String(elements.incidentToDate.value || '');
+
+  const perPage = parseInt(String(elements.incidentPageSize.value || '10'), 10);
+  state.incidentView.perPage = [5, 10, 15, 20].includes(perPage) ? perPage : 10;
+};
+
+const getFilteredIncidents = () => {
+  const fromTs = toTimestamp(state.incidentView.from);
+  const toTs = toTimestamp(state.incidentView.to);
+
+  return state.incidents.filter((incident) => {
+    const searchableValues = [
+      incident.incident_title,
+      incident.incident_description,
+      incident.incident_status,
+      incident.incident_severity,
+      incident.called_user_name,
+      incident.called_number,
+      incident.problem_id
+    ]
+      .map((value) => normalizeFilterText(value))
+      .join(' ');
+
+    if (state.incidentView.search && !searchableValues.includes(state.incidentView.search)) {
+      return false;
+    }
+
+    const status = normalizeFilterText(incident.incident_status);
+    if (state.incidentView.status && !status.includes(state.incidentView.status)) {
+      return false;
+    }
+
+    const severity = normalizeFilterText(incident.incident_severity);
+    if (state.incidentView.severity && !severity.includes(state.incidentView.severity)) {
+      return false;
+    }
+
+    if (state.incidentView.attended === 'yes' && !incident.incident_attended) {
+      return false;
+    }
+
+    if (state.incidentView.attended === 'no' && incident.incident_attended) {
+      return false;
+    }
+
+    const incidentTs = toTimestamp(incident.created_at);
+    if (fromTs !== null && (incidentTs === null || incidentTs < fromTs)) {
+      return false;
+    }
+
+    if (toTs !== null && (incidentTs === null || incidentTs > toTs)) {
+      return false;
+    }
+
+    return true;
+  });
+};
+
+const buildIncidentGroups = (incidents) => {
+  const groupBy = state.incidentView.groupBy;
+  if (groupBy === 'none') {
+    return [{ label: '', items: incidents }];
+  }
+
+  const groups = new Map();
+
+  incidents.forEach((incident) => {
+    let key = 'General';
+
+    if (groupBy === 'severity') {
+      key = incident.incident_severity || 'UNKNOWN';
+    }
+
+    if (groupBy === 'status') {
+      key = incident.incident_status || 'OPEN';
+    }
+
+    if (groupBy === 'attended') {
+      key = incident.incident_attended ? 'Atendida: Sí' : 'Atendida: No';
+    }
+
+    if (groupBy === 'user') {
+      key = incident.called_user_name || 'Sin usuario enlazado';
+    }
+
+    if (groupBy === 'day') {
+      key = incident.created_at ? new Date(incident.created_at).toLocaleDateString('es-CL') : 'Sin fecha';
+    }
+
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+
+    groups.get(key).push(incident);
+  });
+
+  return Array.from(groups.entries()).map(([label, items]) => ({ label, items }));
 };
 
 const apiFetch = async (url, options = {}) => {
@@ -66,15 +207,34 @@ const apiFetch = async (url, options = {}) => {
 };
 
 const renderIncidents = () => {
-  if (!state.incidents.length) {
-    elements.incidentList.innerHTML = '<li class="incident-item">Aun no hay incidentes.</li>';
-    return;
-  }
-
+  syncIncidentViewFromControls();
   const adminCanDelete = isAdmin();
 
-  elements.incidentList.innerHTML = state.incidents
-    .map((incident) => {
+  const filteredIncidents = getFilteredIncidents();
+  const totalItems = filteredIncidents.length;
+  const perPage = state.incidentView.perPage;
+  const totalPages = Math.max(1, Math.ceil(totalItems / perPage));
+
+  if (state.incidentView.page > totalPages) {
+    state.incidentView.page = totalPages;
+  }
+
+  const page = state.incidentView.page;
+  const startIndex = totalItems ? (page - 1) * perPage : 0;
+  const pageIncidents = filteredIncidents.slice(startIndex, startIndex + perPage);
+  const groupedIncidents = buildIncidentGroups(pageIncidents);
+
+  if (!totalItems) {
+    elements.incidentList.innerHTML = '<li class="incident-item">No hay incidentes para los filtros seleccionados.</li>';
+  } else {
+    elements.incidentList.innerHTML = groupedIncidents
+      .map((group) => {
+        const groupTitle = group.label
+          ? `<li class="incident-group-header">Grupo: ${escapeHtml(group.label)} (${group.items.length})</li>`
+          : '';
+
+        const items = group.items
+          .map((incident) => {
       const linkedUser = incident.called_user_name || 'Sin coincidencia';
       const attendedLabel = incident.incident_attended ? 'Si' : 'No';
       const title = escapeHtml(incident.incident_title || 'Sin titulo');
@@ -105,8 +265,20 @@ const renderIncidents = () => {
           <div class="item-actions">${adminAction}</div>
         </li>
       `;
-    })
-    .join('');
+          })
+          .join('');
+
+        return `${groupTitle}${items}`;
+      })
+      .join('');
+  }
+
+  const pageStart = totalItems ? startIndex + 1 : 0;
+  const pageEnd = totalItems ? Math.min(startIndex + perPage, totalItems) : 0;
+  elements.incidentPaginationInfo.textContent = `Mostrando ${pageStart}-${pageEnd} de ${totalItems}`;
+  elements.incidentPageIndicator.textContent = `Página ${page}/${totalPages}`;
+  elements.incidentPrevPage.disabled = page <= 1;
+  elements.incidentNextPage.disabled = page >= totalPages;
 };
 
 const renderUsers = () => {
@@ -263,6 +435,25 @@ const logout = () => {
   elements.loginForm.reset();
   elements.loginError.textContent = '';
   elements.userInfoList.innerHTML = '';
+  state.incidentView.page = 1;
+};
+
+const resetIncidentFilters = () => {
+  elements.incidentSearchInput.value = '';
+  elements.incidentGroupBy.value = 'none';
+  elements.incidentStatusFilter.value = '';
+  elements.incidentSeverityFilter.value = '';
+  elements.incidentAttendedFilter.value = 'all';
+  elements.incidentFromDate.value = '';
+  elements.incidentToDate.value = '';
+  elements.incidentPageSize.value = '10';
+  state.incidentView.page = 1;
+  renderIncidents();
+};
+
+const onIncidentFilterChanged = () => {
+  state.incidentView.page = 1;
+  renderIncidents();
 };
 
 elements.loginForm.addEventListener('submit', async (event) => {
@@ -396,6 +587,30 @@ elements.incidentList.addEventListener('click', async (event) => {
   } catch (error) {
     elements.adminError.textContent = error.message;
   }
+});
+
+elements.incidentSearchInput.addEventListener('input', onIncidentFilterChanged);
+elements.incidentGroupBy.addEventListener('change', onIncidentFilterChanged);
+elements.incidentStatusFilter.addEventListener('input', onIncidentFilterChanged);
+elements.incidentSeverityFilter.addEventListener('input', onIncidentFilterChanged);
+elements.incidentAttendedFilter.addEventListener('change', onIncidentFilterChanged);
+elements.incidentFromDate.addEventListener('change', onIncidentFilterChanged);
+elements.incidentToDate.addEventListener('change', onIncidentFilterChanged);
+elements.incidentPageSize.addEventListener('change', onIncidentFilterChanged);
+elements.incidentClearFilters.addEventListener('click', resetIncidentFilters);
+
+elements.incidentPrevPage.addEventListener('click', () => {
+  if (state.incidentView.page <= 1) {
+    return;
+  }
+
+  state.incidentView.page -= 1;
+  renderIncidents();
+});
+
+elements.incidentNextPage.addEventListener('click', () => {
+  state.incidentView.page += 1;
+  renderIncidents();
 });
 
 elements.logoutBtn.addEventListener('click', logout);

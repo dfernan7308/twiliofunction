@@ -11,6 +11,27 @@ const firstNonEmpty = (...values) => {
   return '';
 };
 
+const toBoolean = (value, fallback = false) => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on', 'si', 'sí'].includes(normalized)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+
+  return fallback;
+};
+
 exports.handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') {
     return json(200, { ok: true });
@@ -30,6 +51,7 @@ exports.handler = async (event) => {
 
   try {
     const body = parseJsonBody(event);
+    const eventType = firstNonEmpty(body.event_type, body.eventType, 'incident_created').toLowerCase();
 
     const calledNumber = firstNonEmpty(
       body.called_number,
@@ -38,6 +60,12 @@ exports.handler = async (event) => {
       body.to,
       body.notifiedNumber,
       body.notified_number
+    );
+
+    const problemId = firstNonEmpty(body.problem_id, body.problemId, body.ProblemID, body.problem_id);
+    const incidentAttended = toBoolean(
+      body.incident_attended,
+      toBoolean(body.incidentAttended, toBoolean(body.attended, false))
     );
 
     const incidentTitle = firstNonEmpty(
@@ -54,6 +82,51 @@ exports.handler = async (event) => {
 
     const normalized = normalizePhone(calledNumber);
     const supabase = getSupabaseAdmin();
+
+    if (eventType === 'ack_update') {
+      if (!problemId) {
+        return json(400, { error: 'problem_id is required for ack_update' });
+      }
+
+      let lookupQuery = supabase
+        .from('incidents')
+        .select('id')
+        .eq('problem_id', problemId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (calledNumber) {
+        lookupQuery = lookupQuery.eq('called_number', calledNumber);
+      }
+
+      const { data: latestIncident, error: lookupError } = await lookupQuery.maybeSingle();
+      if (lookupError) {
+        return json(500, { error: 'Failed to locate incident for ack update', details: lookupError.message });
+      }
+
+      if (!latestIncident) {
+        return json(404, { error: 'Incident not found for ack update' });
+      }
+
+      const updatePayload = {
+        incident_attended: incidentAttended,
+        incident_attended_at: incidentAttended ? new Date().toISOString() : null,
+        incident_status: incidentStatus
+      };
+
+      const { data: updated, error: updateError } = await supabase
+        .from('incidents')
+        .update(updatePayload)
+        .eq('id', latestIncident.id)
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+        .single();
+
+      if (updateError) {
+        return json(500, { error: 'Failed to update incident acknowledgment', details: updateError.message });
+      }
+
+      return json(200, { incident: updated, updated: true });
+    }
 
     let matchedUser = null;
     if (normalized) {
@@ -72,19 +145,22 @@ exports.handler = async (event) => {
     }
 
     const incidentPayload = {
+      problem_id: problemId || null,
       incident_title: incidentTitle,
       incident_status: incidentStatus,
       incident_severity: incidentSeverity,
       incident_description: incidentDescription,
       called_number: calledNumber || null,
       called_user_id: matchedUser ? matchedUser.id : null,
-      called_user_name: matchedUser ? matchedUser.username : null
+      called_user_name: matchedUser ? matchedUser.username : null,
+      incident_attended: incidentAttended,
+      incident_attended_at: incidentAttended ? new Date().toISOString() : null
     };
 
     const { data: created, error: incidentError } = await supabase
       .from('incidents')
       .insert(incidentPayload)
-      .select('id, incident_title, called_number, called_user_name, created_at')
+      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
       .single();
 
     if (incidentError) {

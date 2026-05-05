@@ -20,7 +20,7 @@ exports.handler = async (event) => {
     const supabase = getSupabaseAdmin();
     const { data, error } = await supabase
       .from('incidents')
-      .select('id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, created_at')
+      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
       .order('created_at', { ascending: false })
       .limit(200);
 

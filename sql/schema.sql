@@ -24,6 +24,7 @@ create unique index if not exists app_users_email_unique_idx on public.app_users
 
 create table if not exists public.incidents (
   id bigserial primary key,
+  problem_id text,
   incident_title text not null,
   incident_status text not null default 'OPEN',
   incident_severity text not null default 'UNKNOWN',
@@ -31,11 +32,21 @@ create table if not exists public.incidents (
   called_number text,
   called_user_id uuid references public.app_users(id) on delete set null,
   called_user_name text,
+  incident_attended boolean not null default false,
+  incident_attended_at timestamptz,
   created_at timestamptz not null default now()
 );
 
+alter table public.incidents add column if not exists problem_id text;
+alter table public.incidents add column if not exists incident_attended boolean;
+alter table public.incidents add column if not exists incident_attended_at timestamptz;
+update public.incidents set incident_attended = false where incident_attended is null;
+alter table public.incidents alter column incident_attended set default false;
+alter table public.incidents alter column incident_attended set not null;
+
 create index if not exists incidents_created_at_idx on public.incidents(created_at desc);
 create index if not exists incidents_called_number_idx on public.incidents(called_number);
+create index if not exists incidents_problem_id_idx on public.incidents(problem_id);
 
 alter table public.app_users enable row level security;
 alter table public.incidents enable row level security;

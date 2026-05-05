@@ -1119,6 +1119,7 @@ const postIncidentToApp = async ({
         called_number: calledNumber,
         called_person_name: calledPersonName || '',
         problem_id: problemId,
+        incident_attended: false,
         priority: incidentSummary.priority,
         category: incidentSummary.category,
         criticality: incidentSummary.criticality,
@@ -1144,6 +1145,43 @@ const postIncidentToApp = async ({
     if (!response.ok) {
         const responseBody = await response.text();
         throw new Error(`App webhook failed with status ${response.status}: ${responseBody}`);
+    }
+
+    return { delivered: true };
+};
+
+const postIncidentAckToApp = async ({
+    appWebhookUrl,
+    appWebhookSecret,
+    problemId,
+    calledNumber,
+    incidentAttended,
+    incidentStatus
+}) => {
+    if (!appWebhookUrl || !problemId) {
+        return { delivered: false, reason: !appWebhookUrl ? 'missing_app_webhook_url' : 'missing_problem_id' };
+    }
+
+    const body = {
+        event_type: 'ack_update',
+        problem_id: problemId,
+        called_number: calledNumber || '',
+        incident_attended: Boolean(incidentAttended),
+        incident_status: firstNonEmpty(incidentStatus, incidentAttended ? 'ACKNOWLEDGED' : 'NOT_ACKNOWLEDGED')
+    };
+
+    const response = await fetchWithTimeoutAndRetry(appWebhookUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(appWebhookSecret ? { 'X-Webhook-Secret': appWebhookSecret } : {})
+        },
+        body: JSON.stringify(body)
+    }, 7000, 1);
+
+    if (!response.ok) {
+        const responseBody = await response.text();
+        throw new Error(`App webhook ack update failed with status ${response.status}: ${responseBody}`);
     }
 
     return { delivered: true };
@@ -1647,6 +1685,19 @@ exports.handler = async function (context, event, callback) {
                     }
                 });
 
+                try {
+                    await postIncidentAckToApp({
+                        appWebhookUrl,
+                        appWebhookSecret,
+                        problemId,
+                        calledNumber: toNumber,
+                        incidentAttended: true,
+                        incidentStatus: 'ACKNOWLEDGED'
+                    });
+                } catch (appError) {
+                    console.log(`Monitoring app ack update error (non-blocking): ${appError.message}`);
+                }
+
                 const confirmedTwiml = buildSimpleTwiml({
                     message: 'Recepción confirmada. Gracias. Finalizamos la llamada.',
                     voice: callMessageVoice,
@@ -1718,6 +1769,19 @@ exports.handler = async function (context, event, callback) {
                     levelIndex
                 }
             });
+
+            try {
+                await postIncidentAckToApp({
+                    appWebhookUrl,
+                    appWebhookSecret,
+                    problemId,
+                    calledNumber: toNumber,
+                    incidentAttended: false,
+                    incidentStatus: 'NOT_ACKNOWLEDGED'
+                });
+            } catch (appError) {
+                console.log(`Monitoring app ack update error (non-blocking): ${appError.message}`);
+            }
 
             const unansweredTwiml = buildSimpleTwiml({
                 message: 'No recibimos una confirmación válida. La llamada será considerada como no atendida.',

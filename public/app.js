@@ -74,12 +74,14 @@ const renderIncidents = () => {
   elements.incidentList.innerHTML = state.incidents
     .map((incident) => {
       const linkedUser = incident.called_user_name || 'Sin coincidencia';
+      const attendedLabel = incident.incident_attended ? 'Si' : 'No';
       const title = escapeHtml(incident.incident_title || 'Sin titulo');
       const severity = escapeHtml(incident.incident_severity || 'UNKNOWN');
       const description = escapeHtml(incident.incident_description || '');
       const status = escapeHtml(incident.incident_status || 'OPEN');
       const calledNumber = escapeHtml(incident.called_number || '-');
       const linked = escapeHtml(linkedUser);
+      const attended = escapeHtml(attendedLabel);
       const adminAction = adminCanDelete
         ? `<button class="danger incident-delete-btn" type="button" data-id="${incident.id}">Eliminar</button>`
         : '';
@@ -95,6 +97,7 @@ const renderIncidents = () => {
             Estado: ${status}<br />
             Numero llamado: ${calledNumber}<br />
             Usuario enlazado: ${linked}<br />
+            Se atendio la incidencia: ${attended}<br />
             Fecha: ${formatDate(incident.created_at)}
           </div>
           <div class="item-actions">${adminAction}</div>

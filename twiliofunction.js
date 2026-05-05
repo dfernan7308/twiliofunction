@@ -5,6 +5,38 @@ const xmlEscape = (value) => String(value || '')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
 
+const crypto = require('crypto');
+
+const FLOW_LOCKS = global.__twilioFlowLocks || (global.__twilioFlowLocks = new Map());
+
+const asBooleanFlag = (value, fallback = false) => {
+    if (value === null || value === undefined) {
+        return fallback;
+    }
+
+    return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+};
+
+const acquireFlowLock = (key, ttlMs) => {
+    const now = Date.now();
+
+    for (const [storedKey, expiresAt] of FLOW_LOCKS.entries()) {
+        if (Number(expiresAt) <= now) {
+            FLOW_LOCKS.delete(storedKey);
+        }
+    }
+
+    const existingExpiresAt = Number(FLOW_LOCKS.get(key) || 0);
+    if (existingExpiresAt > now) {
+        return false;
+    }
+
+    FLOW_LOCKS.set(key, now + Math.max(1000, Number(ttlMs) || 1000));
+    return true;
+};
+
+const isSyntheticProblemId = (value) => String(value || '').startsWith('fp-');
+
 const cleanForSpeech = (value) => String(value || '')
     .replace(/[\r\n]+/g, '. ')
     .replace(/[_/]+/g, ' ')
@@ -507,6 +539,85 @@ const getAffectedEntityValue = (payload) => firstNonEmpty(
     getImpactAnalysisEntityValue(payload)
 );
 
+const extractProblemIdFromUrl = (rawUrl) => {
+    const problemUrl = firstNonEmpty(rawUrl);
+    if (!problemUrl) {
+        return '';
+    }
+
+    const pidMatch = problemUrl.match(/[?;]pid=([^&;#]+)/i);
+    if (pidMatch && pidMatch[1]) {
+        try {
+            return cleanForSpeech(decodeURIComponent(pidMatch[1]));
+        } catch (error) {
+            return cleanForSpeech(pidMatch[1]);
+        }
+    }
+
+    const pathMatch = problemUrl.match(/\/problems\/(?:problemdetails;pid=)?([^/?#;]+)/i);
+    if (pathMatch && pathMatch[1]) {
+        try {
+            return cleanForSpeech(decodeURIComponent(pathMatch[1]));
+        } catch (error) {
+            return cleanForSpeech(pathMatch[1]);
+        }
+    }
+
+    return '';
+};
+
+const resolveProblemId = (payload) => {
+    const explicitProblemId = firstNonEmpty(
+        payload.problemId,
+        payload.problem_id,
+        payload.ProblemID,
+        payload.PROBLEM_ID,
+        payload.problemID,
+        payload['problem.id'],
+        payload['problem_id'],
+        payload['event.problemId'],
+        payload['event.problem_id'],
+        payload.event && payload.event.problemId,
+        payload.event && payload.event.problem_id,
+        extractProblemIdFromUrl(firstNonEmpty(payload.problemUrl, payload.ProblemURL, payload.url, payload.problemURL)),
+        payload.problemDisplayId,
+        payload.displayId,
+        payload.DisplayID,
+        payload.displayID,
+        payload.display_id,
+        payload['event.id'],
+        payload.event && payload.event.id
+    );
+
+    if (explicitProblemId) {
+        return cleanForSpeech(explicitProblemId).toUpperCase();
+    }
+
+    const stableDisplayId = firstNonEmpty(payload.displayId, payload.DisplayID, payload.displayID, payload.display_id, payload.problemDisplayId).toUpperCase();
+    const stableProblemUrl = extractProblemIdFromUrl(firstNonEmpty(payload.problemUrl, payload.ProblemURL, payload.url, payload.problemURL)).toUpperCase();
+
+    const fingerprintSource = [
+        stableDisplayId,
+        stableProblemUrl,
+        firstNonEmpty(payload.title, payload.Titulo, payload.ProblemTitle, payload.problemTitle, payload.alertTitle, payload['event.name']),
+        getRootCauseValue(payload),
+        getAffectedEntityValue(payload),
+        getAffectedUrlValue(payload),
+        getMonitorNameValue(payload),
+        firstNonEmpty(payload.webRequestService, payload.webService)
+    ]
+        .map((item) => cleanForSpeech(item).toLowerCase())
+        .filter(Boolean)
+        .join('|');
+
+    if (!fingerprintSource) {
+        return 'unknown';
+    }
+
+    const digest = crypto.createHash('sha1').update(fingerprintSource).digest('hex').slice(0, 16);
+    return `fp-${digest}`;
+};
+
 const buildDynatraceProblemUrl = (baseUrl, problemId) => {
     if (!baseUrl || !problemId) {
         return '';
@@ -614,6 +725,20 @@ const isCriticalAlert = (payload, incidentSummary) => {
     const criticality = getEffectiveCriticality(payload);
 
     return hasRequiredTag && criticality === 'CRITICAL';
+};
+
+const shouldNotifyForStatus = (context, payload) => {
+    const notifyOnlyOpen = asBooleanFlag(firstNonEmpty(context.NOTIFY_ONLY_OPEN, payload.notifyOnlyOpen, 'true'), true);
+    if (!notifyOnlyOpen) {
+        return true;
+    }
+
+    const normalizedStatus = firstNonEmpty(payload.status, payload.State, payload.state, payload.problemStatus, payload['event.status']).toUpperCase();
+    if (!normalizedStatus) {
+        return true;
+    }
+
+    return ['OPEN', 'ACTIVE', 'PROBLEM_OPEN'].some((allowed) => normalizedStatus.includes(allowed));
 };
 
 const toReadableSeverity = (severity) => {
@@ -1202,6 +1327,59 @@ const postIncidentAckToApp = async ({
     return { delivered: true };
 };
 
+const reserveEscalationToApp = async ({
+    appWebhookUrl,
+    appWebhookSecret,
+    problemId,
+    calledNumber,
+    level,
+    reason
+}) => {
+    if (!appWebhookUrl) {
+        return { delivered: false, reserved: false, reason: 'missing_app_webhook_url' };
+    }
+
+    if (!problemId || !calledNumber) {
+        return { delivered: false, reserved: false, reason: !problemId ? 'missing_problem_id' : 'missing_called_number' };
+    }
+
+    const body = {
+        event_type: 'escalation_reserve',
+        problem_id: problemId,
+        called_number: calledNumber,
+        level: String(level || '2'),
+        reserve_reason: firstNonEmpty(reason, 'escalation')
+    };
+
+    const response = await fetchWithTimeoutAndRetry(appWebhookUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(appWebhookSecret ? { 'X-Webhook-Secret': appWebhookSecret } : {})
+        },
+        body: JSON.stringify(body)
+    }, 7000, 1);
+
+    if (!response.ok) {
+        const responseBody = await response.text();
+        throw new Error(`App webhook escalation reserve failed with status ${response.status}: ${responseBody}`);
+    }
+
+    let parsedBody = null;
+    try {
+        parsedBody = await response.json();
+    } catch (error) {
+        parsedBody = null;
+    }
+
+    return {
+        delivered: true,
+        reserved: Boolean(parsedBody && parsedBody.reserved),
+        duplicate: Boolean(parsedBody && parsedBody.duplicate),
+        reason: firstNonEmpty(parsedBody && parsedBody.reason)
+    };
+};
+
 const postMonitoringEvent = async ({ monitoringBackendUrls, ingestToken, eventType, problemId, payload }) => {
     if (!Array.isArray(monitoringBackendUrls) || !monitoringBackendUrls.length) {
         return;
@@ -1261,12 +1439,15 @@ exports.handler = async function (context, event, callback) {
         payload.ingestToken
     );
 
-    const problemId = payload.problemId || payload.ProblemID || payload.PROBLEM_ID || payload['event.id'] || 'unknown';
+    const problemId = resolveProblemId(payload);
     const mode = payload.mode || 'start';
     const level = payload.level || '1';
     const attempt = parseInt(payload.attempt || '1', 10);
     const levelIndex = parseInt(payload.levelIndex || '0', 10);
     const requireDtmfAck = ['1', 'true', 'yes', 'on'].includes(firstNonEmpty(context.REQUIRE_DTMF_ACK, payload.requireDtmfAck, 'true').toLowerCase());
+    const strictIdempotency = asBooleanFlag(firstNonEmpty(context.STRICT_IDEMPOTENCY, payload.strictIdempotency, 'true'), true);
+    const flowLockTtlSeconds = asPositiveInt(firstNonEmpty(context.FLOW_LOCK_TTL_SECONDS, payload.flowLockTtlSeconds, '1800'), 1800);
+    const flowLockTtlMs = Math.max(1000, flowLockTtlSeconds * 1000);
     const ackMaxReplays = asPositiveInt(firstNonEmpty(context.ACK_MAX_REPLAYS, payload.ackMaxReplays, '2'), 2);
     const callMessageVoice = firstNonEmpty(context.TWILIO_MESSAGE_VOICE, context.TWILIO_VOICE, payload.messageVoice, 'Polly.Lupe-Generative');
     const callMessageLanguage = firstNonEmpty(context.TWILIO_MESSAGE_LANGUAGE, context.TWILIO_LANGUAGE, payload.messageLanguage, 'es-MX');
@@ -1293,7 +1474,7 @@ exports.handler = async function (context, event, callback) {
     const level1List = eventLevel1List.length ? eventLevel1List : rosterLevel1List;
     const level2List = eventLevel2List.length ? eventLevel2List : rosterLevel2List;
 
-    if (shouldEnrichFromDynatrace(context, payload) && requiresDynatraceEnrichment(payload) && problemId !== 'unknown') {
+    if (shouldEnrichFromDynatrace(context, payload) && requiresDynatraceEnrichment(payload) && problemId !== 'unknown' && !isSyntheticProblemId(problemId)) {
         try {
             enrichedProblemDetails = await fetchDynatraceProblemDetails(context, payload, problemId);
             payload = enrichPayloadWithDynatraceProblem(payload, enrichedProblemDetails, context);
@@ -1306,6 +1487,8 @@ exports.handler = async function (context, event, callback) {
     const message = payload.message || incidentSummary.voiceMessage;
     const level2Message = payload.level2Message || `Escalamiento automático. ${incidentSummary.voiceMessage}`;
     const smsMessage = payload.smsMessage || incidentSummary.smsMessage;
+    const startLockKey = `start:${problemId}`;
+    const allowedStatusForNotification = shouldNotifyForStatus(context, payload);
 
     if (!monitoringBackendUrls.length) {
         console.log('MONITORING_BACKEND_URL not configured; dashboard ingestion is disabled');
@@ -1553,6 +1736,78 @@ exports.handler = async function (context, event, callback) {
             return { escalated: false, reason: 'no_next_level_configured' };
         }
 
+        if (strictIdempotency) {
+            try {
+                const reserveResult = await reserveEscalationToApp({
+                    appWebhookUrl,
+                    appWebhookSecret,
+                    problemId,
+                    calledNumber: escalationTarget.toNumber,
+                    level: escalationTarget.level,
+                    reason: firstNonEmpty(reason, callStatus, 'escalation')
+                });
+
+                if (!reserveResult.delivered) {
+                    return { escalated: false, reason: firstNonEmpty(reserveResult.reason, 'escalation_reserve_not_delivered') };
+                }
+
+                if (!reserveResult.reserved) {
+                    await postMonitoringEvent({
+                        monitoringBackendUrls,
+                        ingestToken: monitoringIngestToken,
+                        eventType: 'escalation_duplicate_ignored',
+                        problemId,
+                        payload: {
+                            callStatus: firstNonEmpty(callStatus, 'unknown'),
+                            fromLevel: String(currentLevel),
+                            fromAttempt: currentAttempt,
+                            fromLevelIndex: currentLevelIndex,
+                            toLevel: escalationTarget.level,
+                            toLevelIndex: escalationTarget.levelIndex,
+                            reason: firstNonEmpty(reserveResult.reason, 'escalation_already_reserved')
+                        }
+                    });
+
+                    return { escalated: false, reason: firstNonEmpty(reserveResult.reason, 'escalation_already_reserved') };
+                }
+            } catch (reserveError) {
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'idempotency_guard_blocked',
+                    problemId,
+                    payload: {
+                        callStatus: 'blocked',
+                        reason: 'escalation_reserve_failed',
+                        error: truncateText(reserveError.message || 'unknown error', 260)
+                    }
+                });
+
+                return { escalated: false, reason: 'escalation_reserve_failed' };
+            }
+        }
+
+        const escalationLockKey = `escalation:${problemId}:${escalationTarget.level}:${normalizePhoneNumber(escalationTarget.toNumber)}`;
+        if (!acquireFlowLock(escalationLockKey, flowLockTtlMs)) {
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'escalation_duplicate_ignored',
+                problemId,
+                payload: {
+                    callStatus: firstNonEmpty(callStatus, 'unknown'),
+                    fromLevel: String(currentLevel),
+                    fromAttempt: currentAttempt,
+                    fromLevelIndex: currentLevelIndex,
+                    toLevel: escalationTarget.level,
+                    toLevelIndex: escalationTarget.levelIndex,
+                    reason: firstNonEmpty(reason, 'duplicate_escalation')
+                }
+            });
+
+            return { escalated: false, reason: 'duplicate_escalation_ignored' };
+        }
+
         console.log(`Escalating incident ${problemId} from level ${currentLevel} to level ${escalationTarget.level} due to ${reason || callStatus || 'unknown'}`);
 
         const callSent = await tryDial(
@@ -1701,6 +1956,25 @@ exports.handler = async function (context, event, callback) {
         if (mode === 'callback') {
             const callStatus = (event.CallStatus || payload.CallStatus || '').toLowerCase();
             const callSid = firstNonEmpty(event.CallSid, payload.CallSid);
+            const callbackLockKey = `callback:${problemId}:${level}:${callSid || `${attempt}:${levelIndex}:${callStatus || 'unknown'}`}`;
+
+            if (!acquireFlowLock(callbackLockKey, flowLockTtlMs)) {
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'callback_duplicate_ignored',
+                    problemId,
+                    payload: {
+                        callSid,
+                        callStatus: firstNonEmpty(callStatus, 'unknown'),
+                        level,
+                        attempt,
+                        levelIndex
+                    }
+                });
+                return callback(null, `Duplicate callback ignored for call ${callSid || 'unknown'}`);
+            }
+
             const currentList = level === '2' ? level2List : level1List;
             const toNumber = currentList[levelIndex];
             const answeredBy = firstNonEmpty(
@@ -1949,6 +2223,75 @@ exports.handler = async function (context, event, callback) {
             return callback(null, skipReason);
         }
 
+        if (!allowedStatusForNotification) {
+            const normalizedStatus = firstNonEmpty(payload.status, payload.State, payload.state, payload.problemStatus, payload['event.status']) || 'unknown';
+            const skipReason = `Ignored alert by status filter: status=${normalizedStatus}`;
+            console.log(skipReason);
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'alert_ignored_by_status',
+                problemId,
+                payload: {
+                    callStatus: 'ignored',
+                    status: normalizedStatus,
+                    title: incidentSummary.title,
+                    reason: skipReason
+                }
+            });
+            return callback(null, skipReason);
+        }
+
+        if (strictIdempotency && !appWebhookUrl) {
+            const blockedReason = 'Strict idempotency requires APP_WEBHOOK_URL to dedupe calls across serverless invocations';
+            console.log(blockedReason);
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'idempotency_guard_blocked',
+                problemId,
+                payload: {
+                    callStatus: 'blocked',
+                    reason: 'missing_app_webhook_url'
+                }
+            });
+            return callback(null, blockedReason);
+        }
+
+        if (strictIdempotency && problemId === 'unknown') {
+            const blockedReason = 'Strict idempotency blocked call because a stable problem identifier could not be resolved';
+            console.log(blockedReason);
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'idempotency_guard_blocked',
+                problemId,
+                payload: {
+                    callStatus: 'blocked',
+                    reason: 'missing_stable_problem_id'
+                }
+            });
+            return callback(null, blockedReason);
+        }
+
+        if (!acquireFlowLock(startLockKey, flowLockTtlMs)) {
+            const duplicateStartReason = `Duplicate start ignored for incident ${problemId}`;
+            console.log(duplicateStartReason);
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'start_duplicate_ignored',
+                problemId,
+                payload: {
+                    callStatus: 'ignored',
+                    reason: duplicateStartReason,
+                    severity: getNormalizedSeverity(payload),
+                    title: incidentSummary.title
+                }
+            });
+            return callback(null, duplicateStartReason);
+        }
+
         await postMonitoringEvent({
             monitoringBackendUrls,
             ingestToken: monitoringIngestToken,
@@ -2011,12 +2354,26 @@ exports.handler = async function (context, event, callback) {
                 phoneSent: false,
                 smsSent: false,
                 teamsSent: false,
-                timeoutMs: 2500,
-                retries: 0
+                timeoutMs: 7000,
+                retries: 1
             });
 
             if (appIngestResult.delivered) {
                 console.log(`Incident ${problemId} created in monitoring app before call flow`);
+            }
+
+            if (strictIdempotency && !appIngestResult.delivered) {
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'idempotency_guard_blocked',
+                    problemId,
+                    payload: {
+                        callStatus: 'blocked',
+                        reason: firstNonEmpty(appIngestResult.reason, 'app_webhook_not_delivered')
+                    }
+                });
+                return callback(null, `Start blocked by strict idempotency guard for problem ${problemId}`);
             }
 
             if (appIngestResult.duplicate || appIngestResult.created === false) {
@@ -2034,6 +2391,21 @@ exports.handler = async function (context, event, callback) {
             }
         } catch (appError) {
             console.log(`Monitoring app webhook create error (non-blocking): ${appError.message}`);
+
+                if (strictIdempotency) {
+                    await postMonitoringEvent({
+                        monitoringBackendUrls,
+                        ingestToken: monitoringIngestToken,
+                        eventType: 'idempotency_guard_blocked',
+                        problemId,
+                        payload: {
+                            callStatus: 'blocked',
+                            reason: 'app_webhook_unavailable_during_start_guard',
+                            error: truncateText(appError.message || 'unknown error', 260)
+                        }
+                    });
+                    return callback(null, `Start blocked by strict idempotency guard for problem ${problemId}`);
+                }
         }
 
         const callSent = await tryDial(toNumber, effectiveInitialLevel, 1, 0);

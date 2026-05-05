@@ -62,7 +62,7 @@ exports.handler = async (event) => {
       body.notified_number
     );
 
-    const problemId = firstNonEmpty(body.problem_id, body.problemId, body.ProblemID, body.problem_id);
+    const problemId = firstNonEmpty(body.problem_id, body.problemId, body.ProblemID, body.problem_id).toUpperCase();
     const incidentAttended = toBoolean(
       body.incident_attended,
       toBoolean(body.incidentAttended, toBoolean(body.attended, false))
@@ -152,6 +152,106 @@ exports.handler = async (event) => {
       return json(200, { incident: updated, updated: true });
     }
 
+    if (eventType === 'escalation_reserve') {
+      if (!problemId || !calledNumber) {
+        return json(400, { error: 'problem_id and called_number are required for escalation_reserve' });
+      }
+
+      const reserveLevel = firstNonEmpty(body.level, '2');
+      const reserveStatus = firstNonEmpty(body.incident_status, body.reserve_status, `ESCALATION_RESERVED_L${reserveLevel}`);
+
+      let reserveUser = null;
+      if (normalized) {
+        const { data: reserveMatchedUser, error: reserveUserError } = await supabase
+          .from('app_users')
+          .select('id, username, phone')
+          .eq('phone_normalized', normalized)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (reserveUserError) {
+          return json(500, { error: 'Failed to match escalation user by phone', details: reserveUserError.message });
+        }
+
+        reserveUser = reserveMatchedUser || null;
+      }
+
+      const { data: latestIncident, error: latestIncidentError } = await supabase
+        .from('incidents')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+        .eq('problem_id', problemId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latestIncidentError) {
+        return json(500, { error: 'Failed to locate incident for escalation reserve', details: latestIncidentError.message });
+      }
+
+      if (!latestIncident) {
+        return json(404, { error: 'Incident not found for escalation reserve' });
+      }
+
+      if (normalizePhone(latestIncident.called_number) === calledNumberNormalized) {
+        return json(200, {
+          reserved: false,
+          duplicate: true,
+          reason: 'escalation_already_reserved',
+          incident: latestIncident
+        });
+      }
+
+      const currentStatus = firstNonEmpty(latestIncident.incident_status, 'OPEN');
+      const { data: reservedIncident, error: reserveError } = await supabase
+        .from('incidents')
+        .update({
+          called_number: calledNumber,
+          called_user_id: reserveUser ? reserveUser.id : latestIncident.called_user_id,
+          called_user_name: reserveUser ? reserveUser.username : latestIncident.called_user_name,
+          incident_status: reserveStatus
+        })
+        .eq('id', latestIncident.id)
+        .eq('incident_status', currentStatus)
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+        .maybeSingle();
+
+      if (reserveError) {
+        return json(500, { error: 'Failed to reserve escalation', details: reserveError.message });
+      }
+
+      if (!reservedIncident) {
+        const { data: refreshedIncident, error: refreshedIncidentError } = await supabase
+          .from('incidents')
+          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+          .eq('id', latestIncident.id)
+          .maybeSingle();
+
+        if (refreshedIncidentError) {
+          return json(500, { error: 'Failed to re-check escalation reservation', details: refreshedIncidentError.message });
+        }
+
+        return json(200, {
+          reserved: false,
+          duplicate: true,
+          reason: 'escalation_reservation_conflict',
+          incident: refreshedIncident || latestIncident
+        });
+      }
+
+      return json(200, {
+        reserved: true,
+        duplicate: false,
+        incident: reservedIncident,
+        linkedUser: reserveUser
+          ? {
+              id: reserveUser.id,
+              username: reserveUser.username,
+              phone: reserveUser.phone
+            }
+          : null
+      });
+    }
+
     let matchedUser = null;
     if (normalized) {
       const { data: user, error: userError } = await supabase
@@ -209,6 +309,50 @@ exports.handler = async (event) => {
           created: false,
           duplicate: true,
           reason: 'problem_id_already_exists'
+        });
+      }
+    }
+
+    // Fallback dedupe when source does not provide problem_id.
+    // This suppresses near-identical incident bursts that can trigger repeated calls.
+    if (!problemId) {
+      const dedupeWindowMinutes = Math.max(1, parseInt(process.env.INCIDENT_DEDUPE_WINDOW_MINUTES || '15', 10) || 15);
+      const dedupeSince = new Date(Date.now() - dedupeWindowMinutes * 60 * 1000).toISOString();
+
+      const { data: recentCandidates, error: recentCandidatesError } = await supabase
+        .from('incidents')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+        .eq('incident_title', incidentTitle)
+        .eq('incident_severity', incidentSeverity)
+        .gte('created_at', dedupeSince)
+        .order('created_at', { ascending: false })
+        .limit(25);
+
+      if (recentCandidatesError) {
+        return json(500, { error: 'Failed to check fallback dedupe candidates', details: recentCandidatesError.message });
+      }
+
+      const duplicateCandidate = (Array.isArray(recentCandidates) ? recentCandidates : []).find((item) => {
+        if (!calledNumberNormalized) {
+          return true;
+        }
+
+        return normalizePhone(item.called_number) === calledNumberNormalized;
+      });
+
+      if (duplicateCandidate) {
+        return json(200, {
+          incident: duplicateCandidate,
+          linkedUser: matchedUser
+            ? {
+                id: matchedUser.id,
+                username: matchedUser.username,
+                phone: matchedUser.phone
+              }
+            : null,
+          created: false,
+          duplicate: true,
+          reason: 'fallback_dedupe_window_match'
         });
       }
     }

@@ -1105,7 +1105,9 @@ const postIncidentToApp = async ({
     callStatus,
     phoneSent,
     smsSent,
-    teamsSent
+    teamsSent,
+    timeoutMs = 7000,
+    retries = 1
 }) => {
     if (!appWebhookUrl) {
         return { delivered: false, reason: 'missing_app_webhook_url' };
@@ -1140,7 +1142,7 @@ const postIncidentToApp = async ({
             ...(appWebhookSecret ? { 'X-Webhook-Secret': appWebhookSecret } : {})
         },
         body: JSON.stringify(body)
-    }, 7000, 1);
+    }, timeoutMs, retries);
 
     if (!response.ok) {
         const responseBody = await response.text();
@@ -1862,12 +1864,8 @@ exports.handler = async function (context, event, callback) {
         }
 
         const effectiveInitialLevel = initialLevel === '2' && !initialList[0] ? '1' : initialLevel;
-        const callSent = await tryDial(toNumber, effectiveInitialLevel, 1, 0);
-
-        const smsSent = await trySendSms(toNumber, effectiveInitialLevel, 1, 'initiated');
-        const teamsSent = await trySendTeamsNotification();
-
         const calledPersonName = resolveSpecialistName(context, payload, toNumber);
+
         try {
             const appIngestResult = await postIncidentToApp({
                 appWebhookUrl,
@@ -1877,18 +1875,32 @@ exports.handler = async function (context, event, callback) {
                 problemId,
                 calledNumber: toNumber,
                 calledPersonName,
-                callStatus: 'initiated',
-                phoneSent: callSent,
-                smsSent,
-                teamsSent
+                callStatus: 'OPEN',
+                phoneSent: false,
+                smsSent: false,
+                teamsSent: false,
+                timeoutMs: 2500,
+                retries: 0
             });
 
             if (appIngestResult.delivered) {
-                console.log(`Incident ${problemId} sent to monitoring app webhook`);
+                console.log(`Incident ${problemId} created in monitoring app before call flow`);
             }
         } catch (appError) {
-            console.log(`Monitoring app webhook error (non-blocking): ${appError.message}`);
+            console.log(`Monitoring app webhook create error (non-blocking): ${appError.message}`);
         }
+
+        const callSent = await tryDial(toNumber, effectiveInitialLevel, 1, 0);
+
+        const smsSent = await trySendSms(toNumber, effectiveInitialLevel, 1, 'initiated');
+        const teamsSent = await trySendTeamsNotification();
+
+        console.log('Channel status summary:', JSON.stringify({
+            problemId,
+            phoneSent: callSent,
+            smsSent,
+            teamsSent
+        }));
         callback(null, 'Call initiated');
     } catch (error) {
         console.log(error);

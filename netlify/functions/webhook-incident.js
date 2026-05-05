@@ -81,27 +81,51 @@ exports.handler = async (event) => {
     const incidentDescription = firstNonEmpty(body.incident_description, body.description, body.details, body.message);
 
     const normalized = normalizePhone(calledNumber);
+    const calledNumberNormalized = normalized;
     const supabase = getSupabaseAdmin();
 
     if (eventType === 'ack_update') {
-      if (!problemId) {
-        return json(400, { error: 'problem_id is required for ack_update' });
+      if (!problemId && !calledNumberNormalized) {
+        return json(400, { error: 'problem_id or called_number is required for ack_update' });
       }
 
-      let lookupQuery = supabase
-        .from('incidents')
-        .select('id')
-        .eq('problem_id', problemId)
-        .order('created_at', { ascending: false })
-        .limit(1);
+      let latestIncident = null;
 
-      if (calledNumber) {
-        lookupQuery = lookupQuery.eq('called_number', calledNumber);
+      if (problemId) {
+        const { data: byProblem, error: byProblemError } = await supabase
+          .from('incidents')
+          .select('id, called_number')
+          .eq('problem_id', problemId)
+          .order('created_at', { ascending: false })
+          .limit(10);
+
+        if (byProblemError) {
+          return json(500, { error: 'Failed to locate incident for ack update', details: byProblemError.message });
+        }
+
+        if (Array.isArray(byProblem) && byProblem.length) {
+          if (calledNumberNormalized) {
+            latestIncident = byProblem.find((item) => normalizePhone(item.called_number) === calledNumberNormalized) || byProblem[0];
+          } else {
+            latestIncident = byProblem[0];
+          }
+        }
       }
 
-      const { data: latestIncident, error: lookupError } = await lookupQuery.maybeSingle();
-      if (lookupError) {
-        return json(500, { error: 'Failed to locate incident for ack update', details: lookupError.message });
+      if (!latestIncident && calledNumberNormalized) {
+        const { data: recentCandidates, error: recentError } = await supabase
+          .from('incidents')
+          .select('id, called_number')
+          .order('created_at', { ascending: false })
+          .limit(40);
+
+        if (recentError) {
+          return json(500, { error: 'Failed to locate incident by called number', details: recentError.message });
+        }
+
+        if (Array.isArray(recentCandidates) && recentCandidates.length) {
+          latestIncident = recentCandidates.find((item) => normalizePhone(item.called_number) === calledNumberNormalized) || null;
+        }
       }
 
       if (!latestIncident) {

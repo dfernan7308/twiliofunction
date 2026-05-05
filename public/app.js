@@ -18,9 +18,11 @@ const elements = {
   logoutBtn: document.getElementById('logoutBtn'),
   incidentList: document.getElementById('incidentList'),
   adminPanel: document.getElementById('adminPanel'),
+  userInfoPanel: document.getElementById('userInfoPanel'),
   createUserForm: document.getElementById('createUserForm'),
   adminError: document.getElementById('adminError'),
-  userList: document.getElementById('userList')
+  userList: document.getElementById('userList'),
+  userInfoList: document.getElementById('userInfoList')
 };
 
 const isAdmin = () => Boolean(state.user && state.user.role === 'admin');
@@ -146,6 +148,25 @@ const renderUsers = () => {
     .join('');
 };
 
+const renderCurrentUserInfo = () => {
+  if (!state.user) {
+    elements.userInfoList.innerHTML = '<li class="user-item">Sin información de sesión.</li>';
+    return;
+  }
+
+  const username = escapeHtml(state.user.username || '-');
+  const email = escapeHtml(state.user.email || '-');
+  const phone = escapeHtml(state.user.phone || '-');
+
+  elements.userInfoList.innerHTML = `
+    <li class="user-item">
+      <strong>${username}</strong><br />
+      Correo: ${email}<br />
+      Numero: ${phone}
+    </li>
+  `;
+};
+
 const fetchIncidents = async () => {
   const result = await apiFetch('/api/incidents-list');
   state.incidents = result.incidents || [];
@@ -214,11 +235,15 @@ const enterApp = async () => {
   const displayIdentity = state.user.email || state.user.username;
   elements.sessionInfo.textContent = `${displayIdentity} (${state.user.role})`;
 
-  elements.adminPanel.classList.toggle('hidden', !isAdmin());
+  const adminView = isAdmin();
+  elements.adminPanel.classList.toggle('hidden', !adminView);
+  elements.userInfoPanel.classList.toggle('hidden', adminView);
 
   await fetchIncidents();
-  if (isAdmin()) {
+  if (adminView) {
     await fetchUsers();
+  } else {
+    renderCurrentUserInfo();
   }
 
   await connectRealtime();
@@ -237,6 +262,7 @@ const logout = () => {
   elements.loginCard.classList.remove('hidden');
   elements.loginForm.reset();
   elements.loginError.textContent = '';
+  elements.userInfoList.innerHTML = '';
 };
 
 elements.loginForm.addEventListener('submit', async (event) => {

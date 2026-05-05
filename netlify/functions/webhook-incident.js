@@ -181,6 +181,38 @@ exports.handler = async (event) => {
       incident_attended_at: incidentAttended ? new Date().toISOString() : null
     };
 
+    // Idempotency guard: repeated webhook deliveries for the same problem must not create
+    // multiple incident rows, otherwise the call flow can be triggered more than once.
+    if (problemId) {
+      const { data: existingIncident, error: existingIncidentError } = await supabase
+        .from('incidents')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+        .eq('problem_id', problemId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingIncidentError) {
+        return json(500, { error: 'Failed to check existing incident', details: existingIncidentError.message });
+      }
+
+      if (existingIncident) {
+        return json(200, {
+          incident: existingIncident,
+          linkedUser: matchedUser
+            ? {
+                id: matchedUser.id,
+                username: matchedUser.username,
+                phone: matchedUser.phone
+              }
+            : null,
+          created: false,
+          duplicate: true,
+          reason: 'problem_id_already_exists'
+        });
+      }
+    }
+
     const { data: created, error: incidentError } = await supabase
       .from('incidents')
       .insert(incidentPayload)
@@ -199,7 +231,9 @@ exports.handler = async (event) => {
             username: matchedUser.username,
             phone: matchedUser.phone
           }
-        : null
+        : null,
+      created: true,
+      duplicate: false
     });
   } catch (error) {
     return json(500, { error: 'Unexpected error', details: error.message });

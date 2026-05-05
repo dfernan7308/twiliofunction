@@ -1149,7 +1149,20 @@ const postIncidentToApp = async ({
         throw new Error(`App webhook failed with status ${response.status}: ${responseBody}`);
     }
 
-    return { delivered: true };
+    let parsedBody = null;
+    try {
+        parsedBody = await response.json();
+    } catch (error) {
+        parsedBody = null;
+    }
+
+    return {
+        delivered: true,
+        statusCode: response.status,
+        created: parsedBody && typeof parsedBody.created === 'boolean' ? parsedBody.created : response.status === 201,
+        duplicate: Boolean(parsedBody && parsedBody.duplicate),
+        reason: firstNonEmpty(parsedBody && parsedBody.reason)
+    };
 };
 
 const postIncidentAckToApp = async ({
@@ -1505,6 +1518,84 @@ exports.handler = async function (context, event, callback) {
         }
     };
 
+    const getEscalationTarget = (currentLevel) => {
+        if (String(currentLevel) === '1' && level2List[0]) {
+            return {
+                toNumber: level2List[0],
+                level: '2',
+                attempt: 1,
+                levelIndex: 0
+            };
+        }
+
+        return null;
+    };
+
+    const escalateFromLevel = async ({ currentLevel, currentAttempt, currentLevelIndex, callStatus, reason }) => {
+        const escalationTarget = getEscalationTarget(currentLevel);
+
+        if (!escalationTarget) {
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'escalation_skipped',
+                problemId,
+                payload: {
+                    callStatus: firstNonEmpty(callStatus, 'unknown'),
+                    fromLevel: String(currentLevel),
+                    fromAttempt: currentAttempt,
+                    fromLevelIndex: currentLevelIndex,
+                    reason: firstNonEmpty(reason, 'no_next_level_configured'),
+                    hasLevel2: Boolean(level2List[0])
+                }
+            });
+
+            return { escalated: false, reason: 'no_next_level_configured' };
+        }
+
+        console.log(`Escalating incident ${problemId} from level ${currentLevel} to level ${escalationTarget.level} due to ${reason || callStatus || 'unknown'}`);
+
+        const callSent = await tryDial(
+            escalationTarget.toNumber,
+            escalationTarget.level,
+            escalationTarget.attempt,
+            escalationTarget.levelIndex
+        );
+        const smsSent = await trySendSms(
+            escalationTarget.toNumber,
+            escalationTarget.level,
+            escalationTarget.attempt,
+            firstNonEmpty(callStatus, reason, 'escalated')
+        );
+        const specialistName = resolveSpecialistName(context, payload, escalationTarget.toNumber);
+
+        await postMonitoringEvent({
+            monitoringBackendUrls,
+            ingestToken: monitoringIngestToken,
+            eventType: callSent ? 'call_escalated' : 'call_escalation_failed',
+            problemId,
+            payload: {
+                specialistPhone: escalationTarget.toNumber,
+                specialistName,
+                callStatus: callSent ? 'initiated' : 'failed',
+                smsSent,
+                fromLevel: String(currentLevel),
+                fromAttempt: currentAttempt,
+                fromLevelIndex: currentLevelIndex,
+                toLevel: escalationTarget.level,
+                toAttempt: escalationTarget.attempt,
+                toLevelIndex: escalationTarget.levelIndex,
+                reason: firstNonEmpty(reason, callStatus, 'escalation')
+            }
+        });
+
+        return {
+            escalated: callSent,
+            smsSent,
+            ...escalationTarget
+        };
+    };
+
     const sendTeamsNotification = async () => {
         if (!teamsWebhookUrl) {
             console.log('Missing TEAMS_WEBHOOK_URL; Teams notification not sent');
@@ -1650,6 +1741,29 @@ exports.handler = async function (context, event, callback) {
                 }
             });
 
+            const amdClassification = classifyAmdResult(answeredBy);
+            const shouldEscalateFromCallback = String(level) === '1' && (
+                requireDtmfAck
+                    ? shouldRetryCall(callStatus)
+                    : shouldContinueEscalation(callStatus, answeredBy)
+            );
+
+            if (shouldEscalateFromCallback) {
+                const escalationResult = await escalateFromLevel({
+                    currentLevel: level,
+                    currentAttempt: attempt,
+                    currentLevelIndex: levelIndex,
+                    callStatus: firstNonEmpty(callStatus, 'unknown'),
+                    reason: requireDtmfAck ? 'callback_requires_escalation' : 'callback_retry_escalation'
+                });
+
+                if (escalationResult.escalated) {
+                    return callback(null, `Escalated from level ${level} to level ${escalationResult.level}`);
+                }
+
+                return callback(null, `Escalation from level ${level} skipped: ${escalationResult.reason || 'unknown'}`);
+            }
+
             if (!requireDtmfAck && shouldTreatCallAsHuman(callStatus, answeredBy)) {
                 return callback(null, `Call answered by human on level ${level} attempt ${attempt}`);
             }
@@ -1785,8 +1899,26 @@ exports.handler = async function (context, event, callback) {
                 console.log(`Monitoring app ack update error (non-blocking): ${appError.message}`);
             }
 
+            let escalationResult = null;
+            if (String(level) === '1') {
+                escalationResult = await escalateFromLevel({
+                    currentLevel: level,
+                    currentAttempt: attempt,
+                    currentLevelIndex: levelIndex,
+                    callStatus: 'not_acknowledged',
+                    reason: unansweredReason
+                });
+            }
+
+            let unansweredMessage = 'No recibimos una confirmación válida. La llamada será considerada como no atendida.';
+            if (String(level) === '1') {
+                unansweredMessage = escalationResult && escalationResult.escalated
+                    ? 'No recibimos una confirmación válida. Escalaremos automáticamente al soporte de nivel 2.'
+                    : 'No recibimos una confirmación válida. No fue posible escalar automáticamente al soporte de nivel 2.';
+            }
+
             const unansweredTwiml = buildSimpleTwiml({
-                message: 'No recibimos una confirmación válida. La llamada será considerada como no atendida.',
+                message: unansweredMessage,
                 voice: callMessageVoice,
                 language: callMessageLanguage
             });
@@ -1885,6 +2017,20 @@ exports.handler = async function (context, event, callback) {
 
             if (appIngestResult.delivered) {
                 console.log(`Incident ${problemId} created in monitoring app before call flow`);
+            }
+
+            if (appIngestResult.duplicate || appIngestResult.created === false) {
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'incident_duplicate_ignored',
+                    problemId,
+                    payload: {
+                        callStatus: 'ignored',
+                        reason: firstNonEmpty(appIngestResult.reason, 'problem_id_already_exists')
+                    }
+                });
+                return callback(null, `Duplicate incident ignored for problem ${problemId}`);
             }
         } catch (appError) {
             console.log(`Monitoring app webhook create error (non-blocking): ${appError.message}`);

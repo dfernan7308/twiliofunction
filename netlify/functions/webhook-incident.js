@@ -1,6 +1,7 @@
 const { json, parseJsonBody } = require('./_lib/http');
 const { getSupabaseAdmin } = require('./_lib/supabase');
 const { normalizePhone } = require('./_lib/auth');
+const crypto = require('crypto');
 
 const firstNonEmpty = (...values) => {
   for (const value of values) {
@@ -30,6 +31,22 @@ const toBoolean = (value, fallback = false) => {
   }
 
   return fallback;
+};
+
+const buildDeterministicIncidentId = (problemId) => {
+  const normalized = firstNonEmpty(problemId).toUpperCase();
+  if (!normalized) {
+    return null;
+  }
+
+  const hash = crypto.createHash('sha1').update(normalized).digest('hex').slice(0, 15);
+  let numeric = BigInt(`0x${hash}`);
+  if (numeric === 0n) {
+    numeric = 1n;
+  }
+
+  // Keep generated IDs negative to avoid collisions with regular bigserial growth.
+  return `-${numeric.toString()}`;
 };
 
 exports.handler = async (event) => {
@@ -192,6 +209,15 @@ exports.handler = async (event) => {
         return json(404, { error: 'Incident not found for escalation reserve' });
       }
 
+      if (toBoolean(latestIncident.incident_attended, false)) {
+        return json(200, {
+          reserved: false,
+          duplicate: true,
+          reason: 'incident_already_acknowledged',
+          incident: latestIncident
+        });
+      }
+
       if (normalizePhone(latestIncident.called_number) === calledNumberNormalized) {
         return json(200, {
           reserved: false,
@@ -230,10 +256,19 @@ exports.handler = async (event) => {
           return json(500, { error: 'Failed to re-check escalation reservation', details: refreshedIncidentError.message });
         }
 
+        const refreshedIsAcknowledged = toBoolean(refreshedIncident && refreshedIncident.incident_attended, false);
+        const refreshedNumberReserved = normalizePhone(refreshedIncident && refreshedIncident.called_number) === calledNumberNormalized;
+        let refreshedReason = 'escalation_reservation_conflict';
+        if (refreshedIsAcknowledged) {
+          refreshedReason = 'incident_already_acknowledged';
+        } else if (refreshedNumberReserved) {
+          refreshedReason = 'escalation_already_reserved';
+        }
+
         return json(200, {
           reserved: false,
           duplicate: true,
-          reason: 'escalation_reservation_conflict',
+          reason: refreshedReason,
           incident: refreshedIncident || latestIncident
         });
       }
@@ -268,7 +303,10 @@ exports.handler = async (event) => {
       matchedUser = user || null;
     }
 
+    const deterministicIncidentId = problemId ? buildDeterministicIncidentId(problemId) : null;
+
     const incidentPayload = {
+      ...(deterministicIncidentId ? { id: deterministicIncidentId } : {}),
       problem_id: problemId || null,
       incident_title: incidentTitle,
       incident_status: incidentStatus,
@@ -313,48 +351,62 @@ exports.handler = async (event) => {
       }
     }
 
-    // Fallback dedupe when source does not provide problem_id.
-    // This suppresses near-identical incident bursts that can trigger repeated calls.
-    if (!problemId) {
-      const dedupeWindowMinutes = Math.max(1, parseInt(process.env.INCIDENT_DEDUPE_WINDOW_MINUTES || '15', 10) || 15);
-      const dedupeSince = new Date(Date.now() - dedupeWindowMinutes * 60 * 1000).toISOString();
+    // Similarity dedupe window suppresses near-identical bursts that may arrive with
+    // missing or variant IDs from upstream and would otherwise trigger repeated calls.
+    const dedupeWindowMinutes = Math.max(1, parseInt(process.env.INCIDENT_DEDUPE_WINDOW_MINUTES || '15', 10) || 15);
+    const strictSimilarityDedupe = toBoolean(process.env.STRICT_SIMILARITY_DEDUPE, true);
+    const dedupeSince = new Date(Date.now() - dedupeWindowMinutes * 60 * 1000).toISOString();
 
-      const { data: recentCandidates, error: recentCandidatesError } = await supabase
-        .from('incidents')
-        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
-        .eq('incident_title', incidentTitle)
-        .eq('incident_severity', incidentSeverity)
-        .gte('created_at', dedupeSince)
-        .order('created_at', { ascending: false })
-        .limit(25);
+    const { data: recentCandidates, error: recentCandidatesError } = await supabase
+      .from('incidents')
+      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+      .eq('incident_title', incidentTitle)
+      .eq('incident_severity', incidentSeverity)
+      .gte('created_at', dedupeSince)
+      .order('created_at', { ascending: false })
+      .limit(25);
 
-      if (recentCandidatesError) {
-        return json(500, { error: 'Failed to check fallback dedupe candidates', details: recentCandidatesError.message });
+    if (recentCandidatesError) {
+      return json(500, { error: 'Failed to check recent dedupe candidates', details: recentCandidatesError.message });
+    }
+
+    const duplicateCandidate = (Array.isArray(recentCandidates) ? recentCandidates : []).find((item) => {
+      const sameNumber = calledNumberNormalized
+        ? normalizePhone(item.called_number) === calledNumberNormalized
+        : true;
+
+      if (!sameNumber) {
+        return false;
       }
 
-      const duplicateCandidate = (Array.isArray(recentCandidates) ? recentCandidates : []).find((item) => {
-        if (!calledNumberNormalized) {
-          return true;
-        }
+      if (strictSimilarityDedupe) {
+        return true;
+      }
 
-        return normalizePhone(item.called_number) === calledNumberNormalized;
+      // If either side has no problem_id, or IDs differ only by source variance,
+      // treat close-in-time same-title+severity incidents as duplicates.
+      const existingProblemId = firstNonEmpty(item.problem_id).toUpperCase();
+      if (!problemId || !existingProblemId) {
+        return true;
+      }
+
+      return existingProblemId === problemId;
+    });
+
+    if (duplicateCandidate) {
+      return json(200, {
+        incident: duplicateCandidate,
+        linkedUser: matchedUser
+          ? {
+              id: matchedUser.id,
+              username: matchedUser.username,
+              phone: matchedUser.phone
+            }
+          : null,
+        created: false,
+        duplicate: true,
+        reason: 'recent_similarity_window_match'
       });
-
-      if (duplicateCandidate) {
-        return json(200, {
-          incident: duplicateCandidate,
-          linkedUser: matchedUser
-            ? {
-                id: matchedUser.id,
-                username: matchedUser.username,
-                phone: matchedUser.phone
-              }
-            : null,
-          created: false,
-          duplicate: true,
-          reason: 'fallback_dedupe_window_match'
-        });
-      }
     }
 
     const { data: created, error: incidentError } = await supabase
@@ -364,6 +416,38 @@ exports.handler = async (event) => {
       .single();
 
     if (incidentError) {
+      const isDuplicateKey = incidentError.code === '23505' || /duplicate key/i.test(String(incidentError.message || ''));
+
+      if (problemId && isDuplicateKey) {
+        const { data: existingAfterConflict, error: conflictLookupError } = await supabase
+          .from('incidents')
+          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+          .eq('problem_id', problemId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (conflictLookupError) {
+          return json(500, { error: 'Failed to resolve incident conflict', details: conflictLookupError.message });
+        }
+
+        if (existingAfterConflict) {
+          return json(200, {
+            incident: existingAfterConflict,
+            linkedUser: matchedUser
+              ? {
+                  id: matchedUser.id,
+                  username: matchedUser.username,
+                  phone: matchedUser.phone
+                }
+              : null,
+            created: false,
+            duplicate: true,
+            reason: 'problem_id_atomic_conflict_duplicate'
+          });
+        }
+      }
+
       return json(500, { error: 'Failed to create incident', details: incidentError.message });
     }
 

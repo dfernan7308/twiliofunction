@@ -102,7 +102,9 @@ const getFilteredIncidents = () => {
       incident.incident_severity,
       incident.called_user_name,
       incident.called_number,
-      incident.problem_id
+      incident.problem_id,
+      incident.cause_name,
+      incident.affected_entity
     ]
       .map((value) => normalizeFilterText(value))
       .join(' ');
@@ -244,6 +246,8 @@ const renderIncidents = () => {
       const calledNumber = escapeHtml(incident.called_number || '-');
       const linked = escapeHtml(linkedUser);
       const attended = escapeHtml(attendedLabel);
+      const causeNameRaw = escapeHtml(incident.cause_name || '');
+      const affectedEntityRaw = escapeHtml(incident.affected_entity || '');
       const adminAction = adminCanDelete
         ? `<button class="danger incident-delete-btn" type="button" data-id="${incident.id}">Eliminar</button>`
         : '';
@@ -257,6 +261,8 @@ const renderIncidents = () => {
           <p>${description}</p>
           <div class="incident-meta">
             Estado: ${status}<br />
+            ${causeNameRaw ? `Causa raíz: <strong>${causeNameRaw}</strong><br />` : ''}
+            ${affectedEntityRaw ? `Impactado: <strong>${affectedEntityRaw}</strong><br />` : ''}
             Numero llamado: ${calledNumber}<br />
             Usuario enlazado: ${linked}<br />
             Se atendio la incidencia: ${attended}<br />

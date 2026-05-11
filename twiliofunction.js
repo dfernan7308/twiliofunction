@@ -9,6 +9,25 @@ const crypto = require('crypto');
 
 const FLOW_LOCKS = global.__twilioFlowLocks || (global.__twilioFlowLocks = new Map());
 
+const cleanupExpiredFlowLocks = () => {
+    const now = Date.now();
+    for (const [storedKey, expiresAt] of FLOW_LOCKS.entries()) {
+        if (Number(expiresAt) <= now) {
+            FLOW_LOCKS.delete(storedKey);
+        }
+    }
+};
+
+const setFlowLock = (key, ttlMs) => {
+    cleanupExpiredFlowLocks();
+    FLOW_LOCKS.set(key, Date.now() + Math.max(1000, Number(ttlMs) || 1000));
+};
+
+const hasActiveFlowLock = (key) => {
+    cleanupExpiredFlowLocks();
+    return Number(FLOW_LOCKS.get(key) || 0) > Date.now();
+};
+
 const asBooleanFlag = (value, fallback = false) => {
     if (value === null || value === undefined) {
         return fallback;
@@ -19,19 +38,14 @@ const asBooleanFlag = (value, fallback = false) => {
 
 const acquireFlowLock = (key, ttlMs) => {
     const now = Date.now();
-
-    for (const [storedKey, expiresAt] of FLOW_LOCKS.entries()) {
-        if (Number(expiresAt) <= now) {
-            FLOW_LOCKS.delete(storedKey);
-        }
-    }
+    cleanupExpiredFlowLocks();
 
     const existingExpiresAt = Number(FLOW_LOCKS.get(key) || 0);
     if (existingExpiresAt > now) {
         return false;
     }
 
-    FLOW_LOCKS.set(key, now + Math.max(1000, Number(ttlMs) || 1000));
+    setFlowLock(key, ttlMs);
     return true;
 };
 
@@ -178,6 +192,39 @@ const isDebugEnabled = (value) => ['1', 'true', 'yes', 'on'].includes(String(val
 const shouldEnrichFromDynatrace = (context, payload) => {
     const flag = firstNonEmpty(context.DT_ENRICH_PROBLEMS, payload.dtEnrichProblems, 'true').toLowerCase();
     return ['1', 'true', 'yes', 'on'].includes(flag);
+};
+
+const hasDynatraceIdentitySignals = (payload) => Boolean(firstNonEmpty(
+    payload.problemUrl,
+    payload.ProblemURL,
+    payload.url,
+    payload.problemURL,
+    payload.displayId,
+    payload.DisplayID,
+    payload.display_id,
+    payload.problemDisplayId,
+    payload['event.id'],
+    payload['event.problemId'],
+    payload['event.problem_id'],
+    payload.event && payload.event.id,
+    payload.event && payload.event.problemId,
+    payload.event && payload.event.problem_id
+));
+
+const shouldSkipDynatraceLookupForProblemId = (context, payload, problemId) => {
+    const normalizedProblemId = firstNonEmpty(problemId).toUpperCase();
+    if (!normalizedProblemId) {
+        return false;
+    }
+
+    const configuredSkipPrefixes = normalizeList(firstNonEmpty(
+        context.DT_ENRICH_SKIP_PREFIXES,
+        payload.dtEnrichSkipPrefixes,
+        payload.dt_enrich_skip_prefixes,
+        'SMOKE-,TEST-,DEMO-'
+    )).map((prefix) => String(prefix || '').trim().toUpperCase()).filter(Boolean);
+
+    return configuredSkipPrefixes.some((prefix) => normalizedProblemId.startsWith(prefix));
 };
 
 const parseJsonObject = (value) => {
@@ -384,6 +431,428 @@ const firstNonEmpty = (...values) => {
     return '';
 };
 
+const isOutboundDirection = (direction) => {
+    const normalized = String(direction || '').toLowerCase();
+    return !normalized || normalized.startsWith('outbound');
+};
+
+const isSamePhoneNumber = (left, right) => {
+    const leftNormalized = normalizePhoneNumber(left);
+    const rightNormalized = normalizePhoneNumber(right);
+
+    if (!leftNormalized || !rightNormalized) {
+        return false;
+    }
+
+    return leftNormalized === rightNormalized;
+};
+
+const toCallTimestampMs = (call) => {
+    if (!call) {
+        return 0;
+    }
+
+    const rawTimestamp = call.dateCreated || call.startTime || call.dateUpdated || call.endTime;
+    if (!rawTimestamp) {
+        return 0;
+    }
+
+    if (rawTimestamp instanceof Date) {
+        return rawTimestamp.getTime();
+    }
+
+    const parsedTimestamp = Date.parse(String(rawTimestamp));
+    return Number.isNaN(parsedTimestamp) ? 0 : parsedTimestamp;
+};
+
+const toCallAgeSeconds = (call, nowMs = Date.now()) => {
+    const createdMs = toCallTimestampMs(call);
+    if (!createdMs) {
+        return null;
+    }
+
+    const ageMs = nowMs - createdMs;
+    return ageMs >= 0 ? Math.floor(ageMs / 1000) : null;
+};
+
+const toCallTraceSnapshot = (call, nowMs = Date.now()) => {
+    if (!call) {
+        return null;
+    }
+
+    return {
+        sid: firstNonEmpty(call.sid),
+        status: firstNonEmpty(call.status),
+        direction: firstNonEmpty(call.direction),
+        from: firstNonEmpty(call.from),
+        to: firstNonEmpty(call.to),
+        createdAt: firstNonEmpty(call.dateCreated, call.startTime, call.dateUpdated, call.endTime),
+        ageSeconds: toCallAgeSeconds(call, nowMs)
+    };
+};
+
+const buildDuplicateGuardHint = ({ reason, toNumber, fromNumber, windowSeconds, maxResults }) => {
+    const normalizedReason = String(reason || '').toLowerCase();
+    const destination = firstNonEmpty(toNumber, 'unknown_to');
+    const origin = firstNonEmpty(fromNumber, 'unknown_from');
+    const window = Math.max(1, asPositiveInt(windowSeconds, 90));
+    const max = Math.max(1, asPositiveInt(maxResults, 100));
+
+    if (normalizedReason === 'active_call_in_progress') {
+        return `Ya existe una llamada activa al destino ${destination}. Espera cierre de la llamada actual o evita disparos simultáneos de start para el mismo problema.`;
+    }
+
+    if (normalizedReason === 'recent_call_in_window') {
+        return `Se detectó una llamada reciente para ${destination}. Si este bloqueo es excesivo, disminuye SINGLE_DIAL_PER_LEVEL_WINDOW_SECONDS (actual=${window}) o usa singleDialSmokeWindowSeconds/SINGLE_DIAL_SMOKE_WINDOW_SECONDS para pruebas SMOKE. Si necesitas forzar pruebas controladas, habilita ALLOW_SMOKE_DIAL_GUARD_BYPASS y envía bypassDialGuard=1. Si se escapan duplicados, aumenta la ventana.`;
+    }
+
+    if (normalizedReason === 'no_calls_from_expected_origin') {
+        return `No se encontraron llamadas salientes de ${origin} hacia ${destination}. Verifica TWILIO_FROM y que el número origen real coincida con la configuración.`;
+    }
+
+    if (normalizedReason === 'recent_lookup_failed' || normalizedReason === 'active_lookup_failed') {
+        return `La consulta de historial de llamadas falló. Reintenta y valida permisos/API de Twilio; mientras tanto, sube FLOW_LOCK_TTL_SECONDS para mayor protección local.`;
+    }
+
+    if (normalizedReason === 'no_duplicate_detected') {
+        return `No se detectaron duplicados con la búsqueda actual (maxResults=${max}, windowSeconds=${window}). Si persiste, amplía la ventana o revisa eventos start repetidos en origen.`;
+    }
+
+    return `Revisa origen (${origin}) y destino (${destination}) y ajusta ventana de guard si es necesario (windowSeconds=${window}, maxResults=${max}).`;
+};
+
+const hasRecentOutboundDial = async ({ client, toNumber, fromNumber, windowSeconds = 90, maxResults = 100 }) => {
+    if (!client || !toNumber || !fromNumber) {
+        return {
+            matched: false,
+            reason: 'missing_client_or_numbers',
+            hint: buildDuplicateGuardHint({
+                reason: 'missing_client_or_numbers',
+                toNumber,
+                fromNumber,
+                windowSeconds,
+                maxResults
+            })
+        };
+    }
+
+    const normalizedWindow = Math.max(1, asPositiveInt(windowSeconds, 90));
+    const normalizedMaxResults = Math.max(1, asPositiveInt(maxResults, 100));
+    const normalizedFromNumber = normalizePhoneNumber(fromNumber);
+    const now = Date.now();
+
+    try {
+        const recentCalls = await client.calls.list({
+            to: toNumber,
+            limit: normalizedMaxResults
+        });
+
+        if (!Array.isArray(recentCalls) || !recentCalls.length) {
+            return {
+                matched: false,
+                reason: 'no_calls_for_destination',
+                stats: {
+                    fetchedCount: 0,
+                    outboundCount: 0,
+                    fromMatchCount: 0,
+                    windowSeconds: normalizedWindow,
+                    maxResults: normalizedMaxResults
+                },
+                hint: buildDuplicateGuardHint({
+                    reason: 'no_duplicate_detected',
+                    toNumber,
+                    fromNumber,
+                    windowSeconds: normalizedWindow,
+                    maxResults: normalizedMaxResults
+                })
+            };
+        }
+
+        const outboundCalls = recentCalls.filter((call) => isOutboundDirection(call && call.direction));
+        const matchingFromCalls = normalizedFromNumber
+            ? outboundCalls.filter((call) => isSamePhoneNumber(call && call.from, normalizedFromNumber))
+            : outboundCalls;
+
+        const stats = {
+            fetchedCount: recentCalls.length,
+            outboundCount: outboundCalls.length,
+            fromMatchCount: matchingFromCalls.length,
+            windowSeconds: normalizedWindow,
+            maxResults: normalizedMaxResults
+        };
+
+        if (!matchingFromCalls.length) {
+            return {
+                matched: false,
+                reason: 'no_calls_from_expected_origin',
+                stats,
+                sampleCalls: outboundCalls.slice(0, 3).map((call) => toCallTraceSnapshot(call, now)).filter(Boolean),
+                hint: buildDuplicateGuardHint({
+                    reason: 'no_calls_from_expected_origin',
+                    toNumber,
+                    fromNumber,
+                    windowSeconds: normalizedWindow,
+                    maxResults: normalizedMaxResults
+                })
+            };
+        }
+
+        const recentMatch = matchingFromCalls.find((call) => {
+            const callCreatedMs = toCallTimestampMs(call);
+            if (!callCreatedMs) {
+                return false;
+            }
+
+            const ageMs = now - callCreatedMs;
+            return ageMs >= 0 && ageMs <= normalizedWindow * 1000;
+        });
+
+        if (recentMatch) {
+            const ageSeconds = toCallAgeSeconds(recentMatch, now);
+            console.log(`Recent dial guard matched call ${recentMatch.sid || 'unknown'} status=${recentMatch.status || 'unknown'} ageSeconds=${ageSeconds === null ? 'unknown' : ageSeconds}`);
+            return {
+                matched: true,
+                reason: 'recent_call_in_window',
+                source: 'recent',
+                matchedCall: toCallTraceSnapshot(recentMatch, now),
+                stats,
+                hint: buildDuplicateGuardHint({
+                    reason: 'recent_call_in_window',
+                    toNumber,
+                    fromNumber,
+                    windowSeconds: normalizedWindow,
+                    maxResults: normalizedMaxResults
+                })
+            };
+        }
+
+        return {
+            matched: false,
+            reason: 'no_recent_call_within_window',
+            source: 'recent',
+            stats,
+            sampleCalls: matchingFromCalls.slice(0, 3).map((call) => toCallTraceSnapshot(call, now)).filter(Boolean),
+            hint: buildDuplicateGuardHint({
+                reason: 'no_duplicate_detected',
+                toNumber,
+                fromNumber,
+                windowSeconds: normalizedWindow,
+                maxResults: normalizedMaxResults
+            })
+        };
+    } catch (error) {
+        console.log(`Recent dial guard lookup failed for ${toNumber}: ${error.message}`);
+        return {
+            matched: false,
+            reason: 'recent_lookup_failed',
+            source: 'recent',
+            error: truncateText(error.message || 'unknown_error', 220),
+            hint: buildDuplicateGuardHint({
+                reason: 'recent_lookup_failed',
+                toNumber,
+                fromNumber,
+                windowSeconds: normalizedWindow,
+                maxResults: normalizedMaxResults
+            })
+        };
+    }
+};
+
+const hasActiveOutboundDial = async ({ client, toNumber, fromNumber, maxResults = 100 }) => {
+    if (!client || !toNumber || !fromNumber) {
+        return {
+            matched: false,
+            reason: 'missing_client_or_numbers',
+            source: 'active',
+            hint: buildDuplicateGuardHint({
+                reason: 'missing_client_or_numbers',
+                toNumber,
+                fromNumber,
+                windowSeconds: 0,
+                maxResults
+            })
+        };
+    }
+
+    const normalizedMaxResults = Math.max(1, asPositiveInt(maxResults, 100));
+    const normalizedFromNumber = normalizePhoneNumber(fromNumber);
+    const statusesToCheck = ['queued', 'ringing', 'in-progress'];
+    const statusCounts = {};
+    const now = Date.now();
+
+    try {
+        for (const status of statusesToCheck) {
+            const activeCalls = await client.calls.list({
+                to: toNumber,
+                status,
+                limit: normalizedMaxResults
+            });
+            statusCounts[status] = Array.isArray(activeCalls) ? activeCalls.length : 0;
+
+            const matchingActive = Array.isArray(activeCalls)
+                ? activeCalls.find((call) => {
+                    if (!isOutboundDirection(call && call.direction)) {
+                        return false;
+                    }
+
+                    if (!normalizedFromNumber) {
+                        return true;
+                    }
+
+                    return isSamePhoneNumber(call && call.from, normalizedFromNumber);
+                })
+                : null;
+
+            if (matchingActive) {
+                const firstActive = matchingActive;
+                console.log(`Active dial guard matched call ${firstActive.sid || 'unknown'} status=${firstActive.status || status}`);
+                return {
+                    matched: true,
+                    reason: 'active_call_in_progress',
+                    source: 'active',
+                    matchedCall: toCallTraceSnapshot(firstActive, now),
+                    stats: {
+                        statusCounts,
+                        maxResults: normalizedMaxResults
+                    },
+                    hint: buildDuplicateGuardHint({
+                        reason: 'active_call_in_progress',
+                        toNumber,
+                        fromNumber,
+                        windowSeconds: 0,
+                        maxResults: normalizedMaxResults
+                    })
+                };
+            }
+        }
+
+        return {
+            matched: false,
+            reason: 'no_active_calls',
+            source: 'active',
+            stats: {
+                statusCounts,
+                maxResults: normalizedMaxResults
+            },
+            hint: buildDuplicateGuardHint({
+                reason: 'no_duplicate_detected',
+                toNumber,
+                fromNumber,
+                windowSeconds: 0,
+                maxResults: normalizedMaxResults
+            })
+        };
+    } catch (error) {
+        console.log(`Active dial guard lookup failed for ${toNumber}: ${error.message}`);
+        return {
+            matched: false,
+            reason: 'active_lookup_failed',
+            source: 'active',
+            error: truncateText(error.message || 'unknown_error', 220),
+            hint: buildDuplicateGuardHint({
+                reason: 'active_lookup_failed',
+                toNumber,
+                fromNumber,
+                windowSeconds: 0,
+                maxResults: normalizedMaxResults
+            })
+        };
+    }
+};
+
+const hasExistingOutboundDial = async ({ client, toNumber, fromNumber, windowSeconds = 90, maxResults = 100, includeRecentLookup = true }) => {
+    const activeResult = await hasActiveOutboundDial({
+        client,
+        toNumber,
+        fromNumber,
+        maxResults
+    });
+
+    if (activeResult.matched) {
+        return {
+            matched: true,
+            reason: 'active_call_in_progress',
+            source: 'active',
+            matchedCall: activeResult.matchedCall || null,
+            hint: firstNonEmpty(activeResult.hint),
+            diagnostics: {
+                activeReason: firstNonEmpty(activeResult.reason),
+                recentReason: '',
+                activeStats: activeResult.stats || null,
+                recentStats: null
+            }
+        };
+    }
+
+    if (!includeRecentLookup) {
+        return {
+            matched: false,
+            reason: 'no_duplicate_detected',
+            source: 'active_only',
+            hint: buildDuplicateGuardHint({
+                reason: 'no_duplicate_detected',
+                toNumber,
+                fromNumber,
+                windowSeconds,
+                maxResults
+            }),
+            diagnostics: {
+                activeReason: firstNonEmpty(activeResult.reason),
+                recentReason: 'recent_lookup_skipped',
+                activeStats: activeResult.stats || null,
+                recentStats: null,
+                activeError: firstNonEmpty(activeResult.error),
+                recentError: ''
+            }
+        };
+    }
+
+    const recentResult = await hasRecentOutboundDial({
+        client,
+        toNumber,
+        fromNumber,
+        windowSeconds,
+        maxResults
+    });
+
+    if (recentResult.matched) {
+        return {
+            matched: true,
+            reason: 'recent_call_in_window',
+            source: 'recent',
+            matchedCall: recentResult.matchedCall || null,
+            hint: firstNonEmpty(recentResult.hint),
+            diagnostics: {
+                activeReason: firstNonEmpty(activeResult.reason),
+                recentReason: firstNonEmpty(recentResult.reason),
+                activeStats: activeResult.stats || null,
+                recentStats: recentResult.stats || null
+            }
+        };
+    }
+
+    return {
+        matched: false,
+        reason: 'no_duplicate_detected',
+        source: 'none',
+        hint: buildDuplicateGuardHint({
+            reason: 'no_duplicate_detected',
+            toNumber,
+            fromNumber,
+            windowSeconds,
+            maxResults
+        }),
+        diagnostics: {
+            activeReason: firstNonEmpty(activeResult.reason),
+            recentReason: firstNonEmpty(recentResult.reason),
+            activeStats: activeResult.stats || null,
+            recentStats: recentResult.stats || null,
+            activeError: firstNonEmpty(activeResult.error),
+            recentError: firstNonEmpty(recentResult.error)
+        }
+    };
+};
+
 const extractDisplayValue = (value) => {
     if (value === null || value === undefined) {
         return '';
@@ -503,6 +972,8 @@ const getEffectiveCriticality = (payload) => {
 };
 
 const getRootCauseValue = (payload) => firstNonEmpty(
+    extractDisplayValue(payload.ProblemRootCause),
+    extractDisplayValue(payload.problemRootCause),
     extractDisplayValue(payload.Causa),
     extractDisplayValue(payload.causa),
     extractDisplayValue(payload.causeName),
@@ -524,6 +995,10 @@ const getRootCauseValue = (payload) => firstNonEmpty(
 );
 
 const getAffectedEntityValue = (payload) => firstNonEmpty(
+    extractDisplayValue(payload.ProblemImpact),
+    extractDisplayValue(payload.problemImpact),
+    extractDisplayValue(payload.ImpactedEntity),
+    extractDisplayValue(payload.impactedEntity),
     extractDisplayValue(payload.EntidadAfectada),
     extractDisplayValue(payload.entidadAfectada),
     extractDisplayValue(payload.affectedEntity),
@@ -966,7 +1441,38 @@ const buildAmdAuditRecord = ({ problemId, callSid, level, attempt, levelIndex, t
     auditedAt: new Date().toISOString()
 });
 
-const buildAmdStatusCallbackUrl = (baseUrl, context, payload, query) => {
+const buildUrlWithParams = (baseUrl, params = {}) => {
+    const rawBase = firstNonEmpty(baseUrl);
+    if (!rawBase) {
+        return '';
+    }
+
+    const upsertParams = (searchParams) => {
+        Object.entries(params || {}).forEach(([key, value]) => {
+            if (value === null || value === undefined || String(value).trim() === '') {
+                searchParams.delete(key);
+            } else {
+                searchParams.set(key, String(value));
+            }
+        });
+    };
+
+    try {
+        const parsed = new URL(rawBase);
+        upsertParams(parsed.searchParams);
+        return parsed.toString();
+    } catch (error) {
+        const [withoutHash, hash = ''] = rawBase.split('#');
+        const [path, existingQuery = ''] = withoutHash.split('?');
+        const searchParams = new URLSearchParams(existingQuery);
+        upsertParams(searchParams);
+        const query = searchParams.toString();
+        const hashSuffix = hash ? `#${hash}` : '';
+        return `${path}${query ? `?${query}` : ''}${hashSuffix}`;
+    }
+};
+
+const buildAmdStatusCallbackUrl = (baseUrl, context, payload, params) => {
     const callbackBaseUrl = firstNonEmpty(
         context.AMD_STATUS_CALLBACK_URL,
         payload.amdStatusCallback,
@@ -978,8 +1484,7 @@ const buildAmdStatusCallbackUrl = (baseUrl, context, payload, query) => {
         return '';
     }
 
-    const separator = callbackBaseUrl.includes('?') ? '&' : '?';
-    return `${callbackBaseUrl}${separator}${query}`;
+    return buildUrlWithParams(callbackBaseUrl, params);
 };
 
 const getAnsweredByFromCall = async (client, callSid) => {
@@ -993,6 +1498,32 @@ const getAnsweredByFromCall = async (client, callSid) => {
     } catch (error) {
         console.log(`Unable to fetch answeredBy for call ${callSid}: ${error.message}`);
         return '';
+    }
+};
+
+const getCallStatusFromCall = async (client, callSid) => {
+    if (!callSid) {
+        return '';
+    }
+
+    try {
+        const call = await client.calls(callSid).fetch();
+        return String(firstNonEmpty(call && (call.status || call.callStatus || call.call_status)) || '').toLowerCase();
+    } catch (error) {
+        console.log(`Unable to fetch call status for ${callSid}: ${error.message}`);
+        return '';
+    }
+};
+
+const logCallStatusTrace = (enabled, tag, details) => {
+    if (!enabled) {
+        return;
+    }
+
+    try {
+        console.log(`[CALLSTATUS_TRACE] ${tag} ${JSON.stringify(details || {})}`);
+    } catch (error) {
+        console.log(`[CALLSTATUS_TRACE] ${tag} serialization_error=${error.message}`);
     }
 };
 
@@ -1160,20 +1691,53 @@ const asPositiveInt = (value, fallback) => {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
-const buildUrlWithQuery = (baseUrl, query) => {
-    if (!baseUrl) {
-        return '';
-    }
-
-    const separator = baseUrl.includes('?') ? '&' : '?';
-    return `${baseUrl}${separator}${query}`;
+const buildAckActionUrl = ({ functionBaseUrl, problemId, level, attempt, levelIndex, toNumber, replayCount }) => {
+    return buildUrlWithParams(functionBaseUrl, {
+        mode: 'ack',
+        problemId,
+        level,
+        attempt,
+        levelIndex,
+        to: toNumber || '',
+        replayCount
+    });
 };
 
-const buildAckActionUrl = ({ functionBaseUrl, problemId, level, attempt, levelIndex, toNumber, replayCount }) => {
-    return buildUrlWithQuery(
+const buildStatusCallbackUrl = ({ functionBaseUrl, problemId, level, attempt, levelIndex, ackConfirmed }) => {
+    return buildUrlWithParams(functionBaseUrl, {
+        mode: 'callback',
+        problemId,
+        level,
+        attempt,
+        levelIndex,
+        ackConfirmed: ackConfirmed ? '1' : '0'
+    });
+};
+
+const persistAckConfirmationOnCall = async ({ client, callSid, functionBaseUrl, problemId, level, attempt, levelIndex }) => {
+    if (!client || !callSid || !functionBaseUrl) {
+        return false;
+    }
+
+    const confirmedStatusCallbackUrl = buildStatusCallbackUrl({
         functionBaseUrl,
-        `mode=ack&problemId=${encodeURIComponent(problemId)}&level=${encodeURIComponent(level)}&attempt=${encodeURIComponent(attempt)}&levelIndex=${encodeURIComponent(levelIndex)}&to=${encodeURIComponent(toNumber || '')}&replayCount=${encodeURIComponent(replayCount)}`
-    );
+        problemId,
+        level,
+        attempt,
+        levelIndex,
+        ackConfirmed: true
+    });
+
+    try {
+        await client.calls(callSid).update({
+            statusCallback: confirmedStatusCallbackUrl,
+            statusCallbackMethod: 'POST'
+        });
+        return true;
+    } catch (error) {
+        console.log(`Unable to persist ACK confirmation in status callback for call ${callSid}: ${error.message}`);
+        return false;
+    }
 };
 
 const buildInteractiveCallTwiml = ({ sayMessage, actionUrl, voice, language }) => {
@@ -1440,12 +2004,37 @@ exports.handler = async function (context, event, callback) {
     );
 
     const problemId = resolveProblemId(payload);
-    const mode = payload.mode || 'start';
+    const mode = firstNonEmpty(payload.mode, event.mode, 'start').toLowerCase();
+    const hasCallbackCallSid = Boolean(firstNonEmpty(event.CallSid, payload.CallSid, payload.callSid));
+    const hasExplicitMode = Boolean(firstNonEmpty(payload.mode, event.mode));
     const level = payload.level || '1';
     const attempt = parseInt(payload.attempt || '1', 10);
     const levelIndex = parseInt(payload.levelIndex || '0', 10);
     const requireDtmfAck = ['1', 'true', 'yes', 'on'].includes(firstNonEmpty(context.REQUIRE_DTMF_ACK, payload.requireDtmfAck, 'true').toLowerCase());
+    const traceCallStatus = asBooleanFlag(firstNonEmpty(context.TRACE_CALL_STATUS, payload.traceCallStatus, 'true'), true);
     const strictIdempotency = asBooleanFlag(firstNonEmpty(context.STRICT_IDEMPOTENCY, payload.strictIdempotency, 'true'), true);
+    const disableSmokeEscalation = asBooleanFlag(firstNonEmpty(context.DISABLE_SMOKE_ESCALATION, payload.disableSmokeEscalation, 'true'), true);
+    const enforceSingleDialPerLevel = asBooleanFlag(firstNonEmpty(context.ENFORCE_SINGLE_DIAL_PER_LEVEL, payload.enforceSingleDialPerLevel, 'true'), true);
+    const recentDialGuardEnabled = asBooleanFlag(firstNonEmpty(context.ENABLE_RECENT_DIAL_GUARD, payload.enableRecentDialGuard, 'true'), true);
+    const enableActiveDialGuard = asBooleanFlag(firstNonEmpty(context.ENABLE_ACTIVE_DIAL_GUARD, payload.enableActiveDialGuard, 'true'), true);
+    const enableSmokeStartRecentGuard = asBooleanFlag(firstNonEmpty(context.ENABLE_SMOKE_START_RECENT_GUARD, payload.enableSmokeStartRecentGuard, 'true'), true);
+    const smokeStartRecentGuardWindowSeconds = Math.max(5, asPositiveInt(firstNonEmpty(context.SMOKE_START_RECENT_GUARD_WINDOW_SECONDS, payload.smokeStartRecentGuardWindowSeconds, '45'), 45));
+    const enableSmokeEscalationRecentGuard = asBooleanFlag(firstNonEmpty(context.ENABLE_SMOKE_ESCALATION_RECENT_GUARD, payload.enableSmokeEscalationRecentGuard, 'true'), true);
+    const smokeEscalationRecentGuardWindowSeconds = Math.max(5, asPositiveInt(firstNonEmpty(context.SMOKE_ESCALATION_RECENT_GUARD_WINDOW_SECONDS, payload.smokeEscalationRecentGuardWindowSeconds, '120'), 120));
+    const recentDialGuardWindowSeconds = Math.max(1, asPositiveInt(firstNonEmpty(context.RECENT_DIAL_GUARD_WINDOW_SECONDS, payload.recentDialGuardWindowSeconds, '90'), 90));
+    const recentDialGuardMaxResults = Math.max(1, asPositiveInt(firstNonEmpty(context.RECENT_DIAL_GUARD_MAX_RESULTS, payload.recentDialGuardMaxResults, '100'), 100));
+    const singleDialPerLevelWindowSeconds = Math.max(
+        recentDialGuardWindowSeconds,
+        Math.max(1, asPositiveInt(firstNonEmpty(context.SINGLE_DIAL_PER_LEVEL_WINDOW_SECONDS, payload.singleDialPerLevelWindowSeconds, '1800'), 1800))
+    );
+    const configuredSingleDialSmokeWindowRaw = firstNonEmpty(
+        context.SINGLE_DIAL_SMOKE_WINDOW_SECONDS,
+        payload.singleDialSmokeWindowSeconds
+    );
+    const hasExplicitSingleDialSmokeWindow = Boolean(configuredSingleDialSmokeWindowRaw);
+    const singleDialSmokeWindowSeconds = hasExplicitSingleDialSmokeWindow
+        ? Math.max(5, asPositiveInt(configuredSingleDialSmokeWindowRaw, singleDialPerLevelWindowSeconds))
+        : singleDialPerLevelWindowSeconds;
     const flowLockTtlSeconds = asPositiveInt(firstNonEmpty(context.FLOW_LOCK_TTL_SECONDS, payload.flowLockTtlSeconds, '1800'), 1800);
     const flowLockTtlMs = Math.max(1000, flowLockTtlSeconds * 1000);
     const ackMaxReplays = asPositiveInt(firstNonEmpty(context.ACK_MAX_REPLAYS, payload.ackMaxReplays, '2'), 2);
@@ -1473,8 +2062,89 @@ exports.handler = async function (context, event, callback) {
 
     const level1List = eventLevel1List.length ? eventLevel1List : rosterLevel1List;
     const level2List = eventLevel2List.length ? eventLevel2List : rosterLevel2List;
+    const skipDynatraceLookup = shouldSkipDynatraceLookupForProblemId(context, payload, problemId);
+    const dynatraceIdentitySignalsPresent = hasDynatraceIdentitySignals(payload);
+    const isSmokeLikeProblemId = shouldSkipDynatraceLookupForProblemId(context, payload, problemId);
+    const enforceSmokeSingleCall = asBooleanFlag(firstNonEmpty(
+        context.ENFORCE_SMOKE_SINGLE_CALL,
+        payload.enforceSmokeSingleCall,
+        'true'
+    ), true);
+    const smokeSingleCallWindowSeconds = Math.min(600, Math.max(60, asPositiveInt(firstNonEmpty(
+        context.SMOKE_SINGLE_CALL_WINDOW_SECONDS,
+        payload.smokeSingleCallWindowSeconds,
+        '300'
+    ), 300)));
+    const effectiveDisableSmokeEscalation = isSmokeLikeProblemId;
+    const enforceSingleDialPerLevelForSmoke = asBooleanFlag(firstNonEmpty(
+        context.ENFORCE_SINGLE_DIAL_PER_LEVEL_FOR_SMOKE,
+        payload.enforceSingleDialPerLevelForSmoke,
+        'false'
+    ), false);
+    const enableRecentDialGuardForSmoke = asBooleanFlag(firstNonEmpty(
+        context.ENABLE_RECENT_DIAL_GUARD_FOR_SMOKE,
+        payload.enableRecentDialGuardForSmoke,
+        'false'
+    ), false);
+    const effectiveEnforceSingleDialPerLevel = enforceSingleDialPerLevel && (!isSmokeLikeProblemId || enforceSingleDialPerLevelForSmoke);
+    const effectiveRecentDialGuardEnabled = recentDialGuardEnabled && (!isSmokeLikeProblemId || enableRecentDialGuardForSmoke);
+    const enforceRecentWindowGuard = effectiveEnforceSingleDialPerLevel || effectiveRecentDialGuardEnabled;
+    const smokeStartRecentGuardActive = isSmokeLikeProblemId && enableSmokeStartRecentGuard && !enforceRecentWindowGuard;
+    const smokeEscalationRecentGuardActive = isSmokeLikeProblemId && enableSmokeEscalationRecentGuard && !enforceRecentWindowGuard;
+    const allowSmokeDialGuardBypass = asBooleanFlag(firstNonEmpty(context.ALLOW_SMOKE_DIAL_GUARD_BYPASS, 'false'), false);
+    const requestDialGuardBypass = asBooleanFlag(firstNonEmpty(
+        payload.bypassDialGuard,
+        payload.forceDialGuardBypass,
+        payload.smokeBypassDialGuard,
+        event.bypassDialGuard,
+        event.forceDialGuardBypass,
+        'false'
+    ), false);
+    const dialGuardBypassActive = isSmokeLikeProblemId && allowSmokeDialGuardBypass && requestDialGuardBypass;
+    const smokeWindowApplied = isSmokeLikeProblemId && hasExplicitSingleDialSmokeWindow;
+    const effectiveSingleDialWindowSeconds = smokeWindowApplied
+        ? Math.min(singleDialPerLevelWindowSeconds, singleDialSmokeWindowSeconds)
+        : singleDialPerLevelWindowSeconds;
 
-    if (shouldEnrichFromDynatrace(context, payload) && requiresDynatraceEnrichment(payload) && problemId !== 'unknown' && !isSyntheticProblemId(problemId)) {
+    logCallStatusTrace(traceCallStatus, 'single_dial_window', {
+        problemId,
+        isSmokeLikeProblemId,
+        hasExplicitSingleDialSmokeWindow,
+        smokeWindowApplied,
+        enableActiveDialGuard,
+        enforceSingleDialPerLevelForSmoke,
+        enableRecentDialGuardForSmoke,
+        effectiveEnforceSingleDialPerLevel,
+        effectiveRecentDialGuardEnabled,
+        enforceRecentWindowGuard,
+        enableSmokeStartRecentGuard,
+        smokeStartRecentGuardWindowSeconds,
+        smokeStartRecentGuardActive,
+        enableSmokeEscalationRecentGuard,
+        smokeEscalationRecentGuardWindowSeconds,
+        smokeEscalationRecentGuardActive,
+        disableSmokeEscalation,
+        effectiveDisableSmokeEscalation,
+        enforceSmokeSingleCall,
+        smokeSingleCallWindowSeconds,
+        allowSmokeDialGuardBypass,
+        requestDialGuardBypass,
+        dialGuardBypassActive,
+        baseSingleDialPerLevelWindowSeconds: singleDialPerLevelWindowSeconds,
+        smokeSingleDialWindowSeconds: singleDialSmokeWindowSeconds,
+        effectiveSingleDialWindowSeconds
+    });
+
+    if (
+        mode === 'start'
+        && !hasCallbackCallSid
+        && shouldEnrichFromDynatrace(context, payload)
+        && requiresDynatraceEnrichment(payload)
+        && problemId !== 'unknown'
+        && !isSyntheticProblemId(problemId)
+        && !skipDynatraceLookup
+        && dynatraceIdentitySignalsPresent
+    ) {
         try {
             enrichedProblemDetails = await fetchDynatraceProblemDetails(context, payload, problemId);
             payload = enrichPayloadWithDynatraceProblem(payload, enrichedProblemDetails, context);
@@ -1546,12 +2216,87 @@ exports.handler = async function (context, event, callback) {
     const dial = async (toNumber, nextLevel, nextAttempt, nextIndex, options = {}) => {
         const smsSent = Boolean(options.smsSent);
         const teamsSent = Boolean(options.teamsSent);
+        const isEscalationDial = String(nextLevel) !== '1';
+        const includeRecentLookupForDial = enforceRecentWindowGuard || (smokeEscalationRecentGuardActive && isEscalationDial);
+        const dialGuardWindowSeconds = includeRecentLookupForDial
+            ? (
+                effectiveEnforceSingleDialPerLevel
+                    ? effectiveSingleDialWindowSeconds
+                    : (smokeEscalationRecentGuardActive && isEscalationDial && !enforceRecentWindowGuard
+                        ? smokeEscalationRecentGuardWindowSeconds
+                        : recentDialGuardWindowSeconds)
+            )
+            : recentDialGuardWindowSeconds;
+        const shouldRunDialGuard = (enableActiveDialGuard || includeRecentLookupForDial) && !dialGuardBypassActive;
         const sayMessage = nextLevel === '2' ? level2Message : message;
+
+        if (dialGuardBypassActive) {
+            logCallStatusTrace(traceCallStatus, 'dial_guard_bypass', {
+                problemId,
+                toNumber,
+                fromNumber,
+                level: nextLevel,
+                attempt: nextAttempt,
+                levelIndex: nextIndex,
+                reason: 'smoke_test_bypass_active'
+            });
+        }
+
+        if (shouldRunDialGuard) {
+            const duplicateDial = await hasExistingOutboundDial({
+                client,
+                toNumber,
+                fromNumber,
+                windowSeconds: dialGuardWindowSeconds,
+                maxResults: recentDialGuardMaxResults,
+                includeRecentLookup: includeRecentLookupForDial
+            });
+
+            logCallStatusTrace(traceCallStatus, 'dial_guard_probe', {
+                problemId,
+                level: nextLevel,
+                attempt: nextAttempt,
+                levelIndex: nextIndex,
+                toNumber,
+                fromNumber,
+                matched: Boolean(duplicateDial && duplicateDial.matched),
+                reason: firstNonEmpty(duplicateDial && duplicateDial.reason),
+                source: firstNonEmpty(duplicateDial && duplicateDial.source),
+                hint: firstNonEmpty(duplicateDial && duplicateDial.hint),
+                matchedCallSid: firstNonEmpty(duplicateDial && duplicateDial.matchedCall && duplicateDial.matchedCall.sid),
+                matchedCallStatus: firstNonEmpty(duplicateDial && duplicateDial.matchedCall && duplicateDial.matchedCall.status),
+                matchedCallAgeSeconds: duplicateDial && duplicateDial.matchedCall ? duplicateDial.matchedCall.ageSeconds : null,
+                recentLookupEnabled: includeRecentLookupForDial,
+                guardWindowSeconds: includeRecentLookupForDial ? dialGuardWindowSeconds : 0,
+                activeProbeReason: firstNonEmpty(duplicateDial && duplicateDial.diagnostics && duplicateDial.diagnostics.activeReason),
+                recentProbeReason: firstNonEmpty(duplicateDial && duplicateDial.diagnostics && duplicateDial.diagnostics.recentReason)
+            });
+
+            if (duplicateDial.matched) {
+                const dialGuardError = new Error(`duplicate dial blocked (${duplicateDial.reason || 'guard_match'})`);
+                dialGuardError.code = 'DUPLICATE_DIAL_BLOCKED';
+                dialGuardError.duplicateDialReason = firstNonEmpty(duplicateDial.reason, 'guard_match');
+                dialGuardError.duplicateDialHint = firstNonEmpty(duplicateDial.hint);
+                dialGuardError.duplicateDialSource = firstNonEmpty(duplicateDial.source);
+                dialGuardError.duplicateDialMatchedCall = duplicateDial.matchedCall || null;
+                dialGuardError.duplicateDialDiagnostics = duplicateDial.diagnostics || null;
+                dialGuardError.duplicateDialWindowSeconds = includeRecentLookupForDial ? dialGuardWindowSeconds : 0;
+                throw dialGuardError;
+            }
+        }
+
         const amdStatusCallback = buildAmdStatusCallbackUrl(
             amdStatusCallbackBaseUrl,
             context,
             payload,
-            `mode=amd&problemId=${encodeURIComponent(problemId)}&level=${nextLevel}&attempt=${nextAttempt}&levelIndex=${nextIndex}&to=${encodeURIComponent(toNumber)}`
+            {
+                mode: 'amd',
+                problemId,
+                level: nextLevel,
+                attempt: nextAttempt,
+                levelIndex: nextIndex,
+                to: toNumber
+            }
         );
         const ackActionUrl = buildAckActionUrl({
             functionBaseUrl,
@@ -1561,6 +2306,14 @@ exports.handler = async function (context, event, callback) {
             levelIndex: nextIndex,
             toNumber,
             replayCount: 0
+        });
+        const statusCallbackUrl = buildStatusCallbackUrl({
+            functionBaseUrl,
+            problemId,
+            level: nextLevel,
+            attempt: nextAttempt,
+            levelIndex: nextIndex,
+            ackConfirmed: false
         });
         const callTwiml = requireDtmfAck
             ? buildInteractiveCallTwiml({
@@ -1586,7 +2339,7 @@ exports.handler = async function (context, event, callback) {
                 asyncAmdStatusCallback: amdStatusCallback,
                 asyncAmdStatusCallbackMethod: 'POST'
             } : {}),
-            statusCallback: `${functionBaseUrl}?mode=callback&problemId=${encodeURIComponent(problemId)}&level=${nextLevel}&attempt=${nextAttempt}&levelIndex=${nextIndex}`,
+            statusCallback: statusCallbackUrl,
             statusCallbackMethod: 'POST',
             statusCallbackEvent: ['completed']
         });
@@ -1680,8 +2433,73 @@ exports.handler = async function (context, event, callback) {
                 smsSent: false,
                 teamsSent: false
             });
-            return true;
+            return {
+                sent: true,
+                duplicateBlocked: false
+            };
         } catch (error) {
+            if (error && error.code === 'DUPLICATE_DIAL_BLOCKED') {
+                const duplicateDialReason = firstNonEmpty(error.duplicateDialReason, 'duplicate_dial_guard_match');
+                const duplicateDialHint = firstNonEmpty(
+                    error.duplicateDialHint,
+                    buildDuplicateGuardHint({
+                        reason: duplicateDialReason,
+                        toNumber,
+                        fromNumber,
+                        windowSeconds: asPositiveInt(error && error.duplicateDialWindowSeconds, effectiveEnforceSingleDialPerLevel ? effectiveSingleDialWindowSeconds : recentDialGuardWindowSeconds),
+                        maxResults: recentDialGuardMaxResults
+                    })
+                );
+                const duplicateDialSource = firstNonEmpty(error.duplicateDialSource, 'unknown');
+                const duplicateDialMatchedCall = error.duplicateDialMatchedCall || null;
+                const duplicateDialDiagnostics = error.duplicateDialDiagnostics || null;
+                console.log(`Dial blocked by duplicate guard: ${duplicateDialReason}. Hint: ${duplicateDialHint}`);
+                console.log(`[DIAL_GUARD_DIAG] ${JSON.stringify({
+                    problemId,
+                    toNumber,
+                    fromNumber,
+                    level: nextLevel,
+                    attempt: nextAttempt,
+                    levelIndex: nextIndex,
+                    reason: duplicateDialReason,
+                    source: duplicateDialSource,
+                    hint: duplicateDialHint,
+                    matchedCall: duplicateDialMatchedCall,
+                    diagnostics: duplicateDialDiagnostics
+                })}`);
+
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'call_duplicate_blocked_pre_dial',
+                    problemId,
+                    payload: {
+                        specialistPhone: toNumber,
+                        callStatus: 'blocked',
+                        level: nextLevel,
+                        attempt: nextAttempt,
+                        levelIndex: nextIndex,
+                        reason: duplicateDialReason,
+                        hint: duplicateDialHint,
+                        guardSource: duplicateDialSource,
+                        matchedCallSid: firstNonEmpty(duplicateDialMatchedCall && duplicateDialMatchedCall.sid),
+                        matchedCallStatus: firstNonEmpty(duplicateDialMatchedCall && duplicateDialMatchedCall.status),
+                        matchedCallAgeSeconds: duplicateDialMatchedCall ? duplicateDialMatchedCall.ageSeconds : null,
+                        activeProbeReason: firstNonEmpty(duplicateDialDiagnostics && duplicateDialDiagnostics.activeReason),
+                        recentProbeReason: firstNonEmpty(duplicateDialDiagnostics && duplicateDialDiagnostics.recentReason)
+                    }
+                });
+
+                return {
+                    sent: false,
+                    duplicateBlocked: true,
+                    reason: duplicateDialReason,
+                    hint: duplicateDialHint,
+                    source: duplicateDialSource,
+                    matchedCall: duplicateDialMatchedCall
+                };
+            }
+
             console.log(`Call error (non-blocking): ${error.message}`);
             await postMonitoringEvent({
                 monitoringBackendUrls,
@@ -1697,7 +2515,11 @@ exports.handler = async function (context, event, callback) {
                     error: truncateText(error.message || 'unknown error', 260)
                 }
             });
-            return false;
+            return {
+                sent: false,
+                duplicateBlocked: false,
+                reason: 'call_create_failed'
+            };
         }
     };
 
@@ -1715,6 +2537,24 @@ exports.handler = async function (context, event, callback) {
     };
 
     const escalateFromLevel = async ({ currentLevel, currentAttempt, currentLevelIndex, callStatus, reason }) => {
+        if (String(currentLevel) === '1' && effectiveDisableSmokeEscalation) {
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'smoke_escalation_skipped',
+                problemId,
+                payload: {
+                    callStatus: firstNonEmpty(callStatus, 'unknown'),
+                    fromLevel: String(currentLevel),
+                    fromAttempt: currentAttempt,
+                    fromLevelIndex: currentLevelIndex,
+                    reason: firstNonEmpty(reason, 'smoke_escalation_disabled')
+                }
+            });
+
+            return { escalated: false, reason: 'smoke_escalation_disabled' };
+        }
+
         const escalationTarget = getEscalationTarget(currentLevel);
 
         if (!escalationTarget) {
@@ -1736,7 +2576,9 @@ exports.handler = async function (context, event, callback) {
             return { escalated: false, reason: 'no_next_level_configured' };
         }
 
-        if (strictIdempotency) {
+        const shouldAttemptPersistentReserve = strictIdempotency || Boolean(appWebhookUrl);
+
+        if (shouldAttemptPersistentReserve) {
             try {
                 const reserveResult = await reserveEscalationToApp({
                     appWebhookUrl,
@@ -1748,10 +2590,25 @@ exports.handler = async function (context, event, callback) {
                 });
 
                 if (!reserveResult.delivered) {
-                    return { escalated: false, reason: firstNonEmpty(reserveResult.reason, 'escalation_reserve_not_delivered') };
+                    const reserveNotDeliveredReason = firstNonEmpty(reserveResult.reason, 'escalation_reserve_not_delivered');
+                    if (strictIdempotency) {
+                        return { escalated: false, reason: reserveNotDeliveredReason };
+                    }
+
+                    console.log(`Escalation reserve soft-failed: ${reserveNotDeliveredReason}`);
+                    await postMonitoringEvent({
+                        monitoringBackendUrls,
+                        ingestToken: monitoringIngestToken,
+                        eventType: 'idempotency_guard_soft_failed',
+                        problemId,
+                        payload: {
+                            callStatus: 'degraded',
+                            reason: reserveNotDeliveredReason
+                        }
+                    });
                 }
 
-                if (!reserveResult.reserved) {
+                if (reserveResult.delivered && !reserveResult.reserved) {
                     await postMonitoringEvent({
                         monitoringBackendUrls,
                         ingestToken: monitoringIngestToken,
@@ -1771,19 +2628,25 @@ exports.handler = async function (context, event, callback) {
                     return { escalated: false, reason: firstNonEmpty(reserveResult.reason, 'escalation_already_reserved') };
                 }
             } catch (reserveError) {
+                if (!strictIdempotency) {
+                    console.log(`Escalation reserve soft-error (non-strict): ${reserveError.message}`);
+                }
+
                 await postMonitoringEvent({
                     monitoringBackendUrls,
                     ingestToken: monitoringIngestToken,
-                    eventType: 'idempotency_guard_blocked',
+                    eventType: strictIdempotency ? 'idempotency_guard_blocked' : 'idempotency_guard_soft_failed',
                     problemId,
                     payload: {
-                        callStatus: 'blocked',
-                        reason: 'escalation_reserve_failed',
+                        callStatus: strictIdempotency ? 'blocked' : 'degraded',
+                        reason: strictIdempotency ? 'escalation_reserve_failed' : 'escalation_reserve_failed_non_strict',
                         error: truncateText(reserveError.message || 'unknown error', 260)
                     }
                 });
 
-                return { escalated: false, reason: 'escalation_reserve_failed' };
+                if (strictIdempotency) {
+                    return { escalated: false, reason: 'escalation_reserve_failed' };
+                }
             }
         }
 
@@ -1810,18 +2673,21 @@ exports.handler = async function (context, event, callback) {
 
         console.log(`Escalating incident ${problemId} from level ${currentLevel} to level ${escalationTarget.level} due to ${reason || callStatus || 'unknown'}`);
 
-        const callSent = await tryDial(
+        const escalationDialResult = await tryDial(
             escalationTarget.toNumber,
             escalationTarget.level,
             escalationTarget.attempt,
             escalationTarget.levelIndex
         );
-        const smsSent = await trySendSms(
-            escalationTarget.toNumber,
-            escalationTarget.level,
-            escalationTarget.attempt,
-            firstNonEmpty(callStatus, reason, 'escalated')
-        );
+        const callSent = Boolean(escalationDialResult && escalationDialResult.sent);
+        const smsSent = callSent
+            ? await trySendSms(
+                escalationTarget.toNumber,
+                escalationTarget.level,
+                escalationTarget.attempt,
+                firstNonEmpty(callStatus, reason, 'escalated')
+            )
+            : false;
         const specialistName = resolveSpecialistName(context, payload, escalationTarget.toNumber);
 
         await postMonitoringEvent({
@@ -1916,6 +2782,26 @@ exports.handler = async function (context, event, callback) {
     };
 
     try {
+        const hasCallSid = Boolean(firstNonEmpty(event.CallSid, payload.CallSid, payload.callSid));
+
+        if (mode === 'start' && hasCallSid) {
+            await postMonitoringEvent({
+                monitoringBackendUrls,
+                ingestToken: monitoringIngestToken,
+                eventType: 'callback_mode_missing_ignored',
+                problemId,
+                payload: {
+                    callStatus: firstNonEmpty(event.CallStatus, payload.CallStatus, payload.callStatus, 'unknown'),
+                    callSid: firstNonEmpty(event.CallSid, payload.CallSid, payload.callSid),
+                    reason: hasExplicitMode
+                        ? 'start_mode_with_callsid_ignored'
+                        : 'callback_like_payload_without_mode'
+                }
+            });
+
+            return callback(null, 'Ignored start request carrying CallSid');
+        }
+
         if (mode === 'amd') {
             const callSid = firstNonEmpty(event.CallSid, payload.CallSid);
             const toNumber = firstNonEmpty(event.To, payload.to, payload.To);
@@ -1957,6 +2843,27 @@ exports.handler = async function (context, event, callback) {
             const callStatus = (event.CallStatus || payload.CallStatus || '').toLowerCase();
             const callSid = firstNonEmpty(event.CallSid, payload.CallSid);
             const callbackLockKey = `callback:${problemId}:${level}:${callSid || `${attempt}:${levelIndex}:${callStatus || 'unknown'}`}`;
+            const ackConfirmedKey = `ack_confirmed:${problemId}:${callSid || `${level}:${attempt}:${levelIndex}`}`;
+            const ackConfirmedFromStatusCallback = asBooleanFlag(firstNonEmpty(
+                event.ackConfirmed,
+                payload.ackConfirmed,
+                payload.ack_confirmed,
+                event.AckConfirmed,
+                payload.AckConfirmed
+            ), false);
+            const ackConfirmedFromMemory = hasActiveFlowLock(ackConfirmedKey);
+
+            logCallStatusTrace(traceCallStatus, 'callback_inbound', {
+                problemId,
+                mode,
+                level,
+                attempt,
+                levelIndex,
+                callSid,
+                eventCallStatus: firstNonEmpty(event.CallStatus),
+                payloadCallStatus: firstNonEmpty(payload.CallStatus, payload.callStatus),
+                rawAnsweredBy: firstNonEmpty(event.AnsweredBy, payload.AnsweredBy, payload.answeredBy)
+            });
 
             if (!acquireFlowLock(callbackLockKey, flowLockTtlMs)) {
                 await postMonitoringEvent({
@@ -2016,11 +2923,31 @@ exports.handler = async function (context, event, callback) {
             });
 
             const amdClassification = classifyAmdResult(answeredBy);
-            const shouldEscalateFromCallback = String(level) === '1' && (
+            const ackConfirmed = ackConfirmedFromStatusCallback || ackConfirmedFromMemory;
+            const callbackEscalationCandidate = String(level) === '1' && (
                 requireDtmfAck
                     ? shouldRetryCall(callStatus)
                     : shouldContinueEscalation(callStatus, answeredBy)
             );
+            const shouldEscalateFromCallback = callbackEscalationCandidate && !effectiveDisableSmokeEscalation;
+
+            logCallStatusTrace(traceCallStatus, 'callback_decision', {
+                problemId,
+                level,
+                attempt,
+                levelIndex,
+                callSid,
+                callStatus,
+                answeredBy,
+                amdClassification,
+                ackConfirmedFromStatusCallback,
+                ackConfirmedFromMemory,
+                ackConfirmed,
+                requireDtmfAck,
+                callbackEscalationCandidate,
+                effectiveDisableSmokeEscalation,
+                shouldEscalateFromCallback
+            });
 
             if (shouldEscalateFromCallback) {
                 const escalationResult = await escalateFromLevel({
@@ -2056,8 +2983,71 @@ exports.handler = async function (context, event, callback) {
             const toNumber = firstNonEmpty(event.To, payload.to, payload.To, payload.toNumber, currentList[levelIndex]);
             const replayCount = asPositiveInt(firstNonEmpty(payload.replayCount, event.replayCount, '0'), 0);
             const sayMessage = level === '2' ? level2Message : message;
+            const ackLockKey = `ack:${problemId}:${callSid || `${level}:${attempt}:${levelIndex}`}:${digit || 'none'}:${replayCount}`;
+            const ackConfirmedKey = `ack_confirmed:${problemId}:${callSid || `${level}:${attempt}:${levelIndex}`}`;
+
+            logCallStatusTrace(traceCallStatus, 'ack_inbound', {
+                problemId,
+                mode,
+                level,
+                attempt,
+                levelIndex,
+                callSid,
+                digit: digit || '',
+                replayCount,
+                eventCallStatus: firstNonEmpty(event.CallStatus),
+                payloadCallStatus: firstNonEmpty(payload.CallStatus, payload.callStatus)
+            });
+
+            if (!acquireFlowLock(ackLockKey, flowLockTtlMs)) {
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'ack_duplicate_ignored',
+                    problemId,
+                    payload: {
+                        specialistPhone: toNumber,
+                        callSid,
+                        callStatus: 'duplicate_ignored',
+                        digit: digit || '',
+                        replayCount,
+                        level,
+                        attempt,
+                        levelIndex
+                    }
+                });
+
+                const duplicateAckTwiml = buildSimpleTwiml({
+                    message: 'Esta confirmación ya fue procesada. Finalizamos la llamada.',
+                    voice: callMessageVoice,
+                    language: callMessageLanguage
+                });
+
+                return callback(null, buildXmlCallbackResponse(duplicateAckTwiml));
+            }
 
             if (digit === '1') {
+                setFlowLock(ackConfirmedKey, flowLockTtlMs);
+
+                const ackPersistedInCall = await persistAckConfirmationOnCall({
+                    client,
+                    callSid,
+                    functionBaseUrl,
+                    problemId,
+                    level,
+                    attempt,
+                    levelIndex
+                });
+
+                logCallStatusTrace(traceCallStatus, 'ack_confirmed', {
+                    problemId,
+                    level,
+                    attempt,
+                    levelIndex,
+                    callSid,
+                    ackPersistedInCall
+                });
+
                 await postMonitoringEvent({
                     monitoringBackendUrls,
                     ingestToken: monitoringIngestToken,
@@ -2069,6 +3059,7 @@ exports.handler = async function (context, event, callback) {
                         callStatus: 'acknowledged',
                         answered: true,
                         digit,
+                        ackPersistedInCall,
                         level,
                         attempt,
                         levelIndex
@@ -2173,8 +3164,59 @@ exports.handler = async function (context, event, callback) {
                 console.log(`Monitoring app ack update error (non-blocking): ${appError.message}`);
             }
 
+            const resolvedAckCallStatus = String(firstNonEmpty(
+                event.CallStatus,
+                payload.CallStatus,
+                payload.callStatus,
+                await getCallStatusFromCall(client, callSid)
+            ) || '').toLowerCase();
+            const resolvedAckAnsweredBy = firstNonEmpty(
+                event.AnsweredBy,
+                payload.AnsweredBy,
+                payload.answeredBy,
+                await getAnsweredByFromCall(client, callSid)
+            );
+            const resolvedAckAmdClassification = classifyAmdResult(resolvedAckAnsweredBy);
+            const callbackOwnsEscalationCandidate = shouldRetryCall(resolvedAckCallStatus)
+                || (Boolean(callSid) && !resolvedAckCallStatus);
+            const callbackOwnsEscalation = callbackOwnsEscalationCandidate && !effectiveDisableSmokeEscalation;
+
+            logCallStatusTrace(traceCallStatus, 'ack_decision', {
+                problemId,
+                level,
+                attempt,
+                levelIndex,
+                callSid,
+                digit: digit || '',
+                replayCount,
+                resolvedAckCallStatus,
+                resolvedAckAnsweredBy,
+                resolvedAckAmdClassification,
+                ackConfirmed: hasActiveFlowLock(ackConfirmedKey),
+                callbackOwnsEscalationCandidate,
+                effectiveDisableSmokeEscalation,
+                callbackOwnsEscalation
+            });
+
+            if (callbackOwnsEscalation) {
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'ack_escalation_deferred_to_callback',
+                    problemId,
+                    payload: {
+                        specialistPhone: toNumber,
+                        callSid,
+                        callStatus: firstNonEmpty(resolvedAckCallStatus, 'unknown'),
+                        level,
+                        attempt,
+                        levelIndex
+                    }
+                });
+            }
+
             let escalationResult = null;
-            if (String(level) === '1') {
+            if (String(level) === '1' && !callbackOwnsEscalation && !effectiveDisableSmokeEscalation) {
                 escalationResult = await escalateFromLevel({
                     currentLevel: level,
                     currentAttempt: attempt,
@@ -2186,9 +3228,15 @@ exports.handler = async function (context, event, callback) {
 
             let unansweredMessage = 'No recibimos una confirmación válida. La llamada será considerada como no atendida.';
             if (String(level) === '1') {
-                unansweredMessage = escalationResult && escalationResult.escalated
-                    ? 'No recibimos una confirmación válida. Escalaremos automáticamente al soporte de nivel 2.'
-                    : 'No recibimos una confirmación válida. No fue posible escalar automáticamente al soporte de nivel 2.';
+                if (effectiveDisableSmokeEscalation) {
+                    unansweredMessage = 'No recibimos una confirmación válida. Para pruebas controladas, no se escalará automáticamente a nivel 2.';
+                } else if (callbackOwnsEscalation) {
+                    unansweredMessage = 'La llamada terminó sin confirmación válida. Escalaremos automáticamente al soporte de nivel 2 por estado de corte o detección automática.';
+                } else {
+                    unansweredMessage = escalationResult && escalationResult.escalated
+                        ? 'No recibimos una confirmación válida. Escalaremos automáticamente al soporte de nivel 2.'
+                        : 'No recibimos una confirmación válida. No fue posible escalar automáticamente al soporte de nivel 2.';
+                }
             }
 
             const unansweredTwiml = buildSimpleTwiml({
@@ -2341,6 +3389,178 @@ exports.handler = async function (context, event, callback) {
         const effectiveInitialLevel = initialLevel === '2' && !initialList[0] ? '1' : initialLevel;
         const calledPersonName = resolveSpecialistName(context, payload, toNumber);
 
+        const shouldRunSmokeSingleCallGuard = isSmokeLikeProblemId && enforceSmokeSingleCall && !dialGuardBypassActive;
+        if (shouldRunSmokeSingleCallGuard) {
+            const smokeSingleCallProbe = await hasExistingOutboundDial({
+                client,
+                toNumber,
+                fromNumber,
+                windowSeconds: smokeSingleCallWindowSeconds,
+                maxResults: recentDialGuardMaxResults,
+                includeRecentLookup: true
+            });
+
+            logCallStatusTrace(traceCallStatus, 'smoke_single_call_probe', {
+                problemId,
+                toNumber,
+                fromNumber,
+                level: effectiveInitialLevel,
+                attempt: 1,
+                levelIndex: 0,
+                matched: Boolean(smokeSingleCallProbe && smokeSingleCallProbe.matched),
+                reason: firstNonEmpty(smokeSingleCallProbe && smokeSingleCallProbe.reason),
+                source: firstNonEmpty(smokeSingleCallProbe && smokeSingleCallProbe.source),
+                hint: firstNonEmpty(smokeSingleCallProbe && smokeSingleCallProbe.hint),
+                matchedCallSid: firstNonEmpty(smokeSingleCallProbe && smokeSingleCallProbe.matchedCall && smokeSingleCallProbe.matchedCall.sid),
+                matchedCallStatus: firstNonEmpty(smokeSingleCallProbe && smokeSingleCallProbe.matchedCall && smokeSingleCallProbe.matchedCall.status),
+                matchedCallAgeSeconds: smokeSingleCallProbe && smokeSingleCallProbe.matchedCall ? smokeSingleCallProbe.matchedCall.ageSeconds : null,
+                guardWindowSeconds: smokeSingleCallWindowSeconds,
+                activeProbeReason: firstNonEmpty(smokeSingleCallProbe && smokeSingleCallProbe.diagnostics && smokeSingleCallProbe.diagnostics.activeReason),
+                recentProbeReason: firstNonEmpty(smokeSingleCallProbe && smokeSingleCallProbe.diagnostics && smokeSingleCallProbe.diagnostics.recentReason)
+            });
+
+            if (smokeSingleCallProbe.matched) {
+                const blockedHint = firstNonEmpty(smokeSingleCallProbe.hint);
+                const blockedReason = `SMOKE single-call guard blocked dial for ${toNumber} within ${smokeSingleCallWindowSeconds}s window${blockedHint ? `. Hint: ${blockedHint}` : ''}`;
+                console.log(blockedReason);
+
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'smoke_single_call_blocked',
+                    problemId,
+                    payload: {
+                        specialistPhone: toNumber,
+                        callStatus: 'blocked',
+                        level: effectiveInitialLevel,
+                        attempt: 1,
+                        levelIndex: 0,
+                        guardWindowSeconds: smokeSingleCallWindowSeconds,
+                        reason: firstNonEmpty(smokeSingleCallProbe.reason, 'smoke_single_call_guard_match'),
+                        hint: blockedHint,
+                        guardSource: firstNonEmpty(smokeSingleCallProbe.source, 'unknown'),
+                        matchedCallSid: firstNonEmpty(smokeSingleCallProbe.matchedCall && smokeSingleCallProbe.matchedCall.sid),
+                        matchedCallStatus: firstNonEmpty(smokeSingleCallProbe.matchedCall && smokeSingleCallProbe.matchedCall.status),
+                        matchedCallAgeSeconds: smokeSingleCallProbe.matchedCall ? smokeSingleCallProbe.matchedCall.ageSeconds : null,
+                        activeProbeReason: firstNonEmpty(smokeSingleCallProbe.diagnostics && smokeSingleCallProbe.diagnostics.activeReason),
+                        recentProbeReason: firstNonEmpty(smokeSingleCallProbe.diagnostics && smokeSingleCallProbe.diagnostics.recentReason)
+                    }
+                });
+
+                return callback(null, blockedReason);
+            }
+        }
+
+        const includeRecentLookupForStart = enforceRecentWindowGuard || smokeStartRecentGuardActive;
+        const startGuardWindowSeconds = includeRecentLookupForStart
+            ? (
+                effectiveEnforceSingleDialPerLevel
+                    ? effectiveSingleDialWindowSeconds
+                    : (smokeStartRecentGuardActive && !enforceRecentWindowGuard
+                        ? smokeStartRecentGuardWindowSeconds
+                        : recentDialGuardWindowSeconds)
+            )
+            : recentDialGuardWindowSeconds;
+        const shouldRunStartDialGuard = (enableActiveDialGuard || includeRecentLookupForStart)
+            && !dialGuardBypassActive
+            && !shouldRunSmokeSingleCallGuard;
+        if (dialGuardBypassActive) {
+            logCallStatusTrace(traceCallStatus, 'start_guard_bypass', {
+                problemId,
+                toNumber,
+                fromNumber,
+                level: effectiveInitialLevel,
+                attempt: 1,
+                levelIndex: 0,
+                reason: 'smoke_test_bypass_active'
+            });
+        }
+        if (shouldRunStartDialGuard) {
+            const duplicateStartDial = await hasExistingOutboundDial({
+                client,
+                toNumber,
+                fromNumber,
+                windowSeconds: startGuardWindowSeconds,
+                maxResults: recentDialGuardMaxResults,
+                includeRecentLookup: includeRecentLookupForStart
+            });
+
+            logCallStatusTrace(traceCallStatus, 'start_guard_probe', {
+                problemId,
+                toNumber,
+                fromNumber,
+                level: effectiveInitialLevel,
+                attempt: 1,
+                levelIndex: 0,
+                matched: Boolean(duplicateStartDial && duplicateStartDial.matched),
+                reason: firstNonEmpty(duplicateStartDial && duplicateStartDial.reason),
+                source: firstNonEmpty(duplicateStartDial && duplicateStartDial.source),
+                hint: firstNonEmpty(duplicateStartDial && duplicateStartDial.hint),
+                matchedCallSid: firstNonEmpty(duplicateStartDial && duplicateStartDial.matchedCall && duplicateStartDial.matchedCall.sid),
+                matchedCallStatus: firstNonEmpty(duplicateStartDial && duplicateStartDial.matchedCall && duplicateStartDial.matchedCall.status),
+                matchedCallAgeSeconds: duplicateStartDial && duplicateStartDial.matchedCall ? duplicateStartDial.matchedCall.ageSeconds : null,
+                recentLookupEnabled: includeRecentLookupForStart,
+                guardWindowSeconds: includeRecentLookupForStart ? startGuardWindowSeconds : 0,
+                activeProbeReason: firstNonEmpty(duplicateStartDial && duplicateStartDial.diagnostics && duplicateStartDial.diagnostics.activeReason),
+                recentProbeReason: firstNonEmpty(duplicateStartDial && duplicateStartDial.diagnostics && duplicateStartDial.diagnostics.recentReason)
+            });
+
+            if (duplicateStartDial.matched) {
+                const guardWindowSeconds = startGuardWindowSeconds;
+                const blockedHint = firstNonEmpty(duplicateStartDial.hint);
+                const duplicateStartReason = firstNonEmpty(duplicateStartDial.reason, 'guard_match');
+                const blockedReason = duplicateStartReason === 'recent_call_in_window'
+                    ? `Start blocked by dial guard for ${toNumber} within ${guardWindowSeconds}s window (${duplicateStartReason})${blockedHint ? `. Hint: ${blockedHint}` : ''}`
+                    : `Start blocked by dial guard for ${toNumber} (${duplicateStartReason})${blockedHint ? `. Hint: ${blockedHint}` : ''}`;
+                console.log(blockedReason);
+                console.log(`[DIAL_GUARD_DIAG] ${JSON.stringify({
+                    problemId,
+                    toNumber,
+                    fromNumber,
+                    level: effectiveInitialLevel,
+                    reason: duplicateStartReason,
+                    source: firstNonEmpty(duplicateStartDial.source, 'unknown'),
+                    hint: blockedHint,
+                    matchedCall: duplicateStartDial.matchedCall || null,
+                    diagnostics: duplicateStartDial.diagnostics || null
+                })}`);
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'start_duplicate_blocked_recent_guard',
+                    problemId,
+                    payload: {
+                        specialistPhone: toNumber,
+                        callStatus: 'blocked',
+                        level: effectiveInitialLevel,
+                        attempt: 1,
+                        levelIndex: 0,
+                        guardWindowSeconds: duplicateStartReason === 'recent_call_in_window' ? guardWindowSeconds : 0,
+                        reason: blockedReason,
+                        hint: blockedHint,
+                        guardSource: firstNonEmpty(duplicateStartDial.source, 'unknown'),
+                        matchedCallSid: firstNonEmpty(duplicateStartDial.matchedCall && duplicateStartDial.matchedCall.sid),
+                        matchedCallStatus: firstNonEmpty(duplicateStartDial.matchedCall && duplicateStartDial.matchedCall.status),
+                        matchedCallAgeSeconds: duplicateStartDial.matchedCall ? duplicateStartDial.matchedCall.ageSeconds : null,
+                        activeProbeReason: firstNonEmpty(duplicateStartDial.diagnostics && duplicateStartDial.diagnostics.activeReason),
+                        recentProbeReason: firstNonEmpty(duplicateStartDial.diagnostics && duplicateStartDial.diagnostics.recentReason)
+                    }
+                });
+                return callback(null, blockedReason);
+            }
+
+            logCallStatusTrace(traceCallStatus, 'start_guard_pass', {
+                problemId,
+                toNumber,
+                fromNumber,
+                level: effectiveInitialLevel,
+                reason: firstNonEmpty(duplicateStartDial.reason, 'no_duplicate_detected'),
+                hint: firstNonEmpty(duplicateStartDial.hint),
+                activeProbeReason: firstNonEmpty(duplicateStartDial.diagnostics && duplicateStartDial.diagnostics.activeReason),
+                recentProbeReason: firstNonEmpty(duplicateStartDial.diagnostics && duplicateStartDial.diagnostics.recentReason)
+            });
+        }
+
         try {
             const appIngestResult = await postIncidentToApp({
                 appWebhookUrl,
@@ -2408,10 +3628,11 @@ exports.handler = async function (context, event, callback) {
                 }
         }
 
-        const callSent = await tryDial(toNumber, effectiveInitialLevel, 1, 0);
+        const initialDialResult = await tryDial(toNumber, effectiveInitialLevel, 1, 0);
+        const callSent = Boolean(initialDialResult && initialDialResult.sent);
 
-        const smsSent = await trySendSms(toNumber, effectiveInitialLevel, 1, 'initiated');
-        const teamsSent = await trySendTeamsNotification();
+        const smsSent = callSent ? await trySendSms(toNumber, effectiveInitialLevel, 1, 'initiated') : false;
+        const teamsSent = callSent ? await trySendTeamsNotification() : false;
 
         console.log('Channel status summary:', JSON.stringify({
             problemId,
@@ -2419,7 +3640,11 @@ exports.handler = async function (context, event, callback) {
             smsSent,
             teamsSent
         }));
-        callback(null, 'Call initiated');
+        const finalStartHint = firstNonEmpty(initialDialResult && initialDialResult.hint);
+        const finalStartMessage = callSent
+            ? 'Call initiated'
+            : `Call skipped: ${firstNonEmpty(initialDialResult && initialDialResult.reason, 'dial_not_sent')}${finalStartHint ? `. Hint: ${finalStartHint}` : ''}`;
+        callback(null, finalStartMessage);
     } catch (error) {
         console.log(error);
         await postMonitoringEvent({

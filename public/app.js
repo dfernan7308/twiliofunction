@@ -5,6 +5,7 @@ const state = {
   user: JSON.parse(localStorage.getItem('appUser') || 'null'),
   incidents: [],
   users: [],
+  areas: [],
   supabase: null,
   realtimeChannel: null,
   incidentView: {
@@ -44,8 +45,12 @@ const elements = {
   adminPanel: document.getElementById('adminPanel'),
   userInfoPanel: document.getElementById('userInfoPanel'),
   createUserForm: document.getElementById('createUserForm'),
+  createUserAreaSelect: document.getElementById('createUserAreaSelect'),
+  createAreaForm: document.getElementById('createAreaForm'),
   adminError: document.getElementById('adminError'),
+  areaError: document.getElementById('areaError'),
   userList: document.getElementById('userList'),
+  areaList: document.getElementById('areaList'),
   userInfoList: document.getElementById('userInfoList')
 };
 
@@ -104,7 +109,8 @@ const getFilteredIncidents = () => {
       incident.called_number,
       incident.problem_id,
       incident.cause_name,
-      incident.affected_entity
+      incident.affected_entity,
+      incident.incident_area
     ]
       .map((value) => normalizeFilterText(value))
       .join(' ');
@@ -173,6 +179,10 @@ const buildIncidentGroups = (incidents) => {
 
     if (groupBy === 'day') {
       key = incident.created_at ? new Date(incident.created_at).toLocaleDateString('es-CL') : 'Sin fecha';
+    }
+
+    if (groupBy === 'area') {
+      key = incident.incident_area || 'Sin area';
     }
 
     if (!groups.has(key)) {
@@ -248,6 +258,7 @@ const renderIncidents = () => {
       const attended = escapeHtml(attendedLabel);
       const causeNameRaw = escapeHtml(incident.cause_name || '');
       const affectedEntityRaw = escapeHtml(incident.affected_entity || '');
+      const incidentAreaRaw = escapeHtml(incident.incident_area || '');
       const adminAction = adminCanDelete
         ? `<button class="danger incident-delete-btn" type="button" data-id="${incident.id}">Eliminar</button>`
         : '';
@@ -261,6 +272,7 @@ const renderIncidents = () => {
           <p>${description}</p>
           <div class="incident-meta">
             Estado: ${status}<br />
+            ${incidentAreaRaw ? `Area: <strong>${incidentAreaRaw}</strong><br />` : ''}
             ${causeNameRaw ? `Causa raíz: <strong>${causeNameRaw}</strong><br />` : ''}
             ${affectedEntityRaw ? `Impactado: <strong>${affectedEntityRaw}</strong><br />` : ''}
             Numero llamado: ${calledNumber}<br />
@@ -287,6 +299,71 @@ const renderIncidents = () => {
   elements.incidentNextPage.disabled = page >= totalPages;
 };
 
+const normalizeTagsInput = (value) => {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean).join('\n');
+  }
+
+  return String(value || '').trim();
+};
+
+const buildAreaOptionsHtml = (selectedAreaId = '') => {
+  const options = (state.areas || [])
+    .filter((area) => area.is_active || String(area.id) === String(selectedAreaId || ''))
+    .map((area) => {
+      const selected = String(area.id) === String(selectedAreaId || '') ? 'selected' : '';
+      const inactiveSuffix = area.is_active ? '' : ' [INACTIVA]';
+      return `<option value="${escapeHtml(area.id)}" ${selected}>${escapeHtml(area.name)} (${escapeHtml(area.code)})${inactiveSuffix}</option>`;
+    });
+
+  if (!options.length) {
+    return '<option value="">Sin areas disponibles</option>';
+  }
+
+  return ['<option value="">Selecciona un area</option>', ...options].join('');
+};
+
+const renderCreateUserAreaOptions = () => {
+  if (!elements.createUserAreaSelect) {
+    return;
+  }
+
+  elements.createUserAreaSelect.innerHTML = buildAreaOptionsHtml('');
+};
+
+const renderAreas = () => {
+  if (!elements.areaList) {
+    return;
+  }
+
+  if (!state.areas.length) {
+    elements.areaList.innerHTML = '<li class="user-item">No hay areas registradas.</li>';
+    return;
+  }
+
+  elements.areaList.innerHTML = state.areas
+    .map((area) => `
+      <li class="user-item">
+        <form class="stack compact area-edit-form" data-id="${area.id}">
+          <label>Nombre del area <input type="text" name="name" value="${escapeHtml(area.name || '')}" required /></label>
+          <label>Codigo <input type="text" name="code" value="${escapeHtml(area.code || '')}" required /></label>
+          <label>Tags (uno por linea o separados por coma)
+            <textarea name="tags" rows="3" placeholder="custom_tag_a\ncustom:tag_b">${escapeHtml(normalizeTagsInput(area.tags))}</textarea>
+          </label>
+          <label class="inline-option">
+            <input type="checkbox" name="is_active" ${area.is_active ? 'checked' : ''} />
+            Activa
+          </label>
+          <div class="item-actions">
+            <button type="submit">Guardar area</button>
+            <button type="button" class="danger area-delete-btn" data-id="${area.id}">Eliminar</button>
+          </div>
+        </form>
+      </li>
+    `)
+    .join('');
+};
+
 const renderUsers = () => {
   if (!state.users.length) {
     elements.userList.innerHTML = '<li class="user-item">No hay usuarios registrados.</li>';
@@ -301,6 +378,12 @@ const renderUsers = () => {
           <label>Nombre <input type="text" name="username" value="${escapeHtml(user.username)}" required /></label>
           <label>Correo <input type="email" name="email" value="${escapeHtml(user.email || '')}" required /></label>
           <label>Numero <input type="text" name="phone" value="${escapeHtml(user.phone || '')}" required /></label>
+          <label>
+            Area
+            <select name="area_id" required>
+              ${buildAreaOptionsHtml(user.area_id || '')}
+            </select>
+          </label>
           <label>
             Rol
             <select name="role">
@@ -335,12 +418,14 @@ const renderCurrentUserInfo = () => {
   const username = escapeHtml(state.user.username || '-');
   const email = escapeHtml(state.user.email || '-');
   const phone = escapeHtml(state.user.phone || '-');
+  const areaName = escapeHtml((state.user.area && state.user.area.name) || state.user.area_name || '-');
 
   elements.userInfoList.innerHTML = `
     <li class="user-item">
       <strong>${username}</strong><br />
       Correo: ${email}<br />
-      Numero: ${phone}
+      Numero: ${phone}<br />
+      Area: ${areaName}
     </li>
   `;
 };
@@ -359,6 +444,17 @@ const fetchUsers = async () => {
   const result = await apiFetch('/api/users-list');
   state.users = result.users || [];
   renderUsers();
+};
+
+const fetchAreas = async () => {
+  if (!isAdmin()) {
+    return;
+  }
+
+  const result = await apiFetch('/api/areas-list');
+  state.areas = result.areas || [];
+  renderCreateUserAreaOptions();
+  renderAreas();
 };
 
 const disconnectRealtime = () => {
@@ -419,6 +515,7 @@ const enterApp = async () => {
 
   await fetchIncidents();
   if (adminView) {
+    await fetchAreas();
     await fetchUsers();
   } else {
     renderCurrentUserInfo();
@@ -433,6 +530,7 @@ const logout = () => {
   state.user = null;
   state.incidents = [];
   state.users = [];
+  state.areas = [];
   localStorage.removeItem('appToken');
   localStorage.removeItem('appUser');
 
@@ -500,6 +598,7 @@ elements.createUserForm.addEventListener('submit', async (event) => {
     email: String(formData.get('email') || '').trim(),
     password: String(formData.get('password') || '').trim(),
     phone: String(formData.get('phone') || '').trim(),
+    area_id: String(formData.get('area_id') || '').trim(),
     role: String(formData.get('role') || 'user').trim()
   };
 
@@ -531,6 +630,7 @@ elements.userList.addEventListener('submit', async (event) => {
     username: String(formData.get('username') || '').trim(),
     email: String(formData.get('email') || '').trim(),
     phone: String(formData.get('phone') || '').trim(),
+    area_id: String(formData.get('area_id') || '').trim(),
     role: String(formData.get('role') || 'user').trim(),
     password: String(formData.get('password') || '').trim(),
     is_active: formData.get('is_active') === 'on'
@@ -545,6 +645,88 @@ elements.userList.addEventListener('submit', async (event) => {
     await fetchUsers();
   } catch (error) {
     elements.adminError.textContent = error.message;
+  }
+});
+
+elements.createAreaForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  elements.areaError.textContent = '';
+
+  const formData = new FormData(elements.createAreaForm);
+  const payload = {
+    name: String(formData.get('name') || '').trim(),
+    code: String(formData.get('code') || '').trim(),
+    tags: String(formData.get('tags') || ''),
+    is_active: formData.get('is_active') === 'on'
+  };
+
+  try {
+    await apiFetch('/api/areas-create', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+
+    elements.createAreaForm.reset();
+    await fetchAreas();
+    await fetchUsers();
+  } catch (error) {
+    elements.areaError.textContent = error.message;
+  }
+});
+
+elements.areaList.addEventListener('submit', async (event) => {
+  const form = event.target.closest('.area-edit-form');
+  if (!form) {
+    return;
+  }
+
+  event.preventDefault();
+  elements.areaError.textContent = '';
+
+  const formData = new FormData(form);
+  const payload = {
+    id: form.dataset.id,
+    name: String(formData.get('name') || '').trim(),
+    code: String(formData.get('code') || '').trim(),
+    tags: String(formData.get('tags') || ''),
+    is_active: formData.get('is_active') === 'on'
+  };
+
+  try {
+    await apiFetch('/api/areas-update', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+
+    await fetchAreas();
+    await fetchUsers();
+  } catch (error) {
+    elements.areaError.textContent = error.message;
+  }
+});
+
+elements.areaList.addEventListener('click', async (event) => {
+  const deleteButton = event.target.closest('.area-delete-btn');
+  if (!deleteButton) {
+    return;
+  }
+
+  if (!window.confirm('Se eliminará el area seleccionada. ¿Continuar?')) {
+    return;
+  }
+
+  elements.areaError.textContent = '';
+
+  try {
+    await apiFetch('/api/areas-delete', {
+      method: 'POST',
+      body: JSON.stringify({ id: deleteButton.dataset.id })
+    });
+
+    await fetchAreas();
+    await fetchUsers();
+  } catch (error) {
+    elements.areaError.textContent = error.message;
   }
 });
 

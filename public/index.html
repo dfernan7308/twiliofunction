@@ -70,6 +70,7 @@
                   <option value="status">Estado</option>
                   <option value="attended">Atención</option>
                   <option value="user">Usuario enlazado</option>
+                  <option value="area">Area</option>
                   <option value="day">Día</option>
                 </select>
               </label>
@@ -129,6 +130,12 @@
               <label>Contraseña <input type="password" name="password" required /></label>
               <label>Número <input type="text" name="phone" placeholder="+56..." required /></label>
               <label>
+                Area
+                <select id="createUserAreaSelect" name="area_id" required>
+                  <option value="">Selecciona un area</option>
+                </select>
+              </label>
+              <label>
                 Rol
                 <select name="role">
                   <option value="user">user</option>
@@ -140,6 +147,23 @@
             <p id="adminError" class="error"></p>
             <p class="hint">Puedes editar o eliminar usuarios existentes.</p>
             <ul id="userList" class="user-list"></ul>
+
+            <h3>Administración de Areas</h3>
+            <form id="createAreaForm" class="stack compact">
+              <label>Nombre del area <input type="text" name="name" required /></label>
+              <label>Código del area <input type="text" name="code" placeholder="SRE" required /></label>
+              <label>Tags (uno por linea o separados por coma)
+                <textarea name="tags" rows="4" placeholder="custom_call_turno_observabilidad&#10;custom:call_turno_observabilidad"></textarea>
+              </label>
+              <label class="inline-option">
+                <input type="checkbox" name="is_active" checked />
+                Activa
+              </label>
+              <button type="submit">Crear area</button>
+            </form>
+            <p id="areaError" class="error"></p>
+            <p class="hint">Gestiona tags por área para enrutar incidencias de forma escalable.</p>
+            <ul id="areaList" class="user-list"></ul>
           </aside>
 
           <aside id="userInfoPanel" class="card hidden">

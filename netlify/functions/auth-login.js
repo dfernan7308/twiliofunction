@@ -23,7 +23,7 @@ exports.handler = async (event) => {
     const supabase = getSupabaseAdmin();
     const { data: user, error } = await supabase
       .from('app_users')
-      .select('id, username, email, role, phone, password_hash, is_active')
+      .select('id, username, email, role, phone, area_id, area:areas(id, code, name), password_hash, is_active')
       .eq('email', email)
       .maybeSingle();
 
@@ -49,7 +49,9 @@ exports.handler = async (event) => {
         username: user.username,
         email: user.email,
         role: user.role,
-        phone: user.phone
+        phone: user.phone,
+        area_id: user.area_id || null,
+        area: user.area || null
       }
     });
   } catch (error) {

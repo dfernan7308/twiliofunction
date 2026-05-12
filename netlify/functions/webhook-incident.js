@@ -33,6 +33,13 @@ const toBoolean = (value, fallback = false) => {
   return fallback;
 };
 
+const normalizeAreaCode = (value) => String(value || '')
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .toUpperCase()
+  .replace(/[^A-Z0-9]+/g, '_')
+  .replace(/^_+|_+$/g, '');
+
 const buildDeterministicIncidentId = (problemId) => {
   const normalized = firstNonEmpty(problemId).toUpperCase();
   if (!normalized) {
@@ -98,6 +105,9 @@ exports.handler = async (event) => {
     const incidentDescription = firstNonEmpty(body.incident_description, body.description, body.details, body.message);
     const causeName = firstNonEmpty(body.cause_name, body.causeName, body.rootCause, body.ProblemRootCause, body.problemRootCause);
     const affectedEntity = firstNonEmpty(body.affected_entity, body.affectedEntity, body.impactedEntity, body.ProblemImpact, body.problemImpact);
+    const incomingAreaId = firstNonEmpty(body.area_id, body.areaId);
+    const incidentAreaInput = firstNonEmpty(body.incident_area, body.incidentArea, body.area_name, body.areaName, body.area);
+    const incidentAreaCodeInput = normalizeAreaCode(firstNonEmpty(body.area_code, body.areaCode, incidentAreaInput));
 
     const normalized = normalizePhone(calledNumber);
     const calledNumberNormalized = normalized;
@@ -289,14 +299,73 @@ exports.handler = async (event) => {
       });
     }
 
+    let resolvedArea = null;
+    if (incomingAreaId) {
+      const { data: areaById, error: areaByIdError } = await supabase
+        .from('areas')
+        .select('id, code, name, is_active')
+        .eq('id', incomingAreaId)
+        .maybeSingle();
+
+      if (areaByIdError) {
+        return json(500, { error: 'Failed to resolve area by id', details: areaByIdError.message });
+      }
+
+      resolvedArea = areaById || null;
+    }
+
+    if (!resolvedArea && incidentAreaCodeInput) {
+      const { data: areaByCode, error: areaByCodeError } = await supabase
+        .from('areas')
+        .select('id, code, name, is_active')
+        .eq('code', incidentAreaCodeInput)
+        .maybeSingle();
+
+      if (areaByCodeError) {
+        return json(500, { error: 'Failed to resolve area by code', details: areaByCodeError.message });
+      }
+
+      resolvedArea = areaByCode || null;
+    }
+
+    if (!resolvedArea && incidentAreaInput) {
+      const { data: areaByName, error: areaByNameError } = await supabase
+        .from('areas')
+        .select('id, code, name, is_active')
+        .ilike('name', incidentAreaInput)
+        .maybeSingle();
+
+      if (areaByNameError) {
+        return json(500, { error: 'Failed to resolve area by name', details: areaByNameError.message });
+      }
+
+      resolvedArea = areaByName || null;
+    }
+
+    if (resolvedArea && !resolvedArea.is_active) {
+      return json(400, { error: 'Resolved area is inactive' });
+    }
+
+    const resolvedAreaId = resolvedArea ? resolvedArea.id : null;
+    const resolvedIncidentArea = firstNonEmpty(
+      resolvedArea && resolvedArea.name,
+      incidentAreaInput,
+      incidentAreaCodeInput
+    );
+
     let matchedUser = null;
     if (normalized) {
-      const { data: user, error: userError } = await supabase
+      let userQuery = supabase
         .from('app_users')
-        .select('id, username, phone')
+        .select('id, username, phone, area_id')
         .eq('phone_normalized', normalized)
-        .eq('is_active', true)
-        .maybeSingle();
+        .eq('is_active', true);
+
+      if (resolvedAreaId) {
+        userQuery = userQuery.eq('area_id', resolvedAreaId);
+      }
+
+      const { data: user, error: userError } = await userQuery.maybeSingle();
 
       if (userError) {
         return json(500, { error: 'Failed to match user by phone', details: userError.message });
@@ -317,6 +386,8 @@ exports.handler = async (event) => {
       called_number: calledNumber || null,
       called_user_id: matchedUser ? matchedUser.id : null,
       called_user_name: matchedUser ? matchedUser.username : null,
+      ...(resolvedAreaId ? { area_id: resolvedAreaId } : {}),
+      ...(resolvedIncidentArea ? { incident_area: resolvedIncidentArea } : {}),
       incident_attended: incidentAttended,
       incident_attended_at: incidentAttended ? new Date().toISOString() : null,
       ...(causeName ? { cause_name: causeName } : {}),
@@ -328,7 +399,7 @@ exports.handler = async (event) => {
     if (problemId) {
       const { data: existingIncident, error: existingIncidentError } = await supabase
         .from('incidents')
-        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, area_id, incident_area, created_at')
         .eq('problem_id', problemId)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -339,8 +410,44 @@ exports.handler = async (event) => {
       }
 
       if (existingIncident) {
+        const duplicatePatch = {};
+
+        if (causeName && !firstNonEmpty(existingIncident.cause_name)) {
+          duplicatePatch.cause_name = causeName;
+        }
+
+        if (affectedEntity && !firstNonEmpty(existingIncident.affected_entity)) {
+          duplicatePatch.affected_entity = affectedEntity;
+        }
+
+        if (resolvedAreaId && !firstNonEmpty(existingIncident.area_id)) {
+          duplicatePatch.area_id = resolvedAreaId;
+        }
+
+        if (resolvedIncidentArea && !firstNonEmpty(existingIncident.incident_area)) {
+          duplicatePatch.incident_area = resolvedIncidentArea;
+        }
+
+        let mergedIncident = existingIncident;
+        if (Object.keys(duplicatePatch).length) {
+          const { data: patchedIncident, error: patchedIncidentError } = await supabase
+            .from('incidents')
+            .update(duplicatePatch)
+            .eq('id', existingIncident.id)
+            .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, area_id, incident_area, created_at')
+            .maybeSingle();
+
+          if (patchedIncidentError) {
+            return json(500, { error: 'Failed to enrich duplicate incident', details: patchedIncidentError.message });
+          }
+
+          if (patchedIncident) {
+            mergedIncident = patchedIncident;
+          }
+        }
+
         return json(200, {
-          incident: existingIncident,
+          incident: mergedIncident,
           linkedUser: matchedUser
             ? {
                 id: matchedUser.id,
@@ -350,7 +457,8 @@ exports.handler = async (event) => {
             : null,
           created: false,
           duplicate: true,
-          reason: 'problem_id_already_exists'
+          reason: 'problem_id_already_exists',
+          updated: Boolean(Object.keys(duplicatePatch).length)
         });
       }
     }
@@ -361,14 +469,20 @@ exports.handler = async (event) => {
     const strictSimilarityDedupe = toBoolean(process.env.STRICT_SIMILARITY_DEDUPE, true);
     const dedupeSince = new Date(Date.now() - dedupeWindowMinutes * 60 * 1000).toISOString();
 
-    const { data: recentCandidates, error: recentCandidatesError } = await supabase
+    let recentCandidatesQuery = supabase
       .from('incidents')
-      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
+      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, area_id, incident_area, created_at')
       .eq('incident_title', incidentTitle)
       .eq('incident_severity', incidentSeverity)
       .gte('created_at', dedupeSince)
       .order('created_at', { ascending: false })
       .limit(25);
+
+    if (resolvedIncidentArea) {
+      recentCandidatesQuery = recentCandidatesQuery.eq('incident_area', resolvedIncidentArea);
+    }
+
+    const { data: recentCandidates, error: recentCandidatesError } = await recentCandidatesQuery;
 
     if (recentCandidatesError) {
       return json(500, { error: 'Failed to check recent dedupe candidates', details: recentCandidatesError.message });
@@ -416,7 +530,7 @@ exports.handler = async (event) => {
     const { data: created, error: incidentError } = await supabase
       .from('incidents')
       .insert(incidentPayload)
-      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
+      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, area_id, incident_area, created_at')
       .single();
 
     if (incidentError) {
@@ -425,7 +539,7 @@ exports.handler = async (event) => {
       if (problemId && isDuplicateKey) {
         const { data: existingAfterConflict, error: conflictLookupError } = await supabase
           .from('incidents')
-          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
+          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, area_id, incident_area, created_at')
           .eq('problem_id', problemId)
           .order('created_at', { ascending: false })
           .limit(1)

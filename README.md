@@ -5,6 +5,7 @@ Aplicación fullstack JavaScript para:
 - Login con roles `admin` y `user`
 - Login por correo y contraseña
 - Administración de usuarios (solo admin)
+- Administración de áreas y tags por área (solo admin)
 - Registro de incidentes entrantes por webhook
 - Enlace automático incidente -> usuario por número telefónico
 - Visualización en tiempo real de incidentes en el dashboard
@@ -59,6 +60,10 @@ npm run dev
 - `POST /api/users-create` crear usuarios (admin)
 - `POST /api/users-update` editar usuarios (admin)
 - `POST /api/users-delete` eliminar usuarios (admin)
+- `GET /api/areas-list` lista áreas
+- `POST /api/areas-create` crear área (admin)
+- `POST /api/areas-update` editar área (admin)
+- `POST /api/areas-delete` eliminar área (admin)
 - `GET /api/incidents-list` lista incidentes
 - `POST /api/incidents-delete` eliminar incidentes (admin)
 - `POST /api/webhook-incident` webhook de incidentes
@@ -91,6 +96,7 @@ Con eso, cuando llegue una alerta, el panel la mostrará de inmediato.
 
 - `APP_WEBHOOK_URL`: URL del webhook del aplicativo. Ejemplo `https://TU-SITIO.netlify.app/api/webhook-incident`
 - `APP_WEBHOOK_SECRET`: mismo secreto configurado en Netlify como `WEBHOOK_SHARED_SECRET` (opcional, recomendado)
+- `AREA_TAG_GROUPS_JSON`: JSON opcional para definir tags por área (si no se define, usa defaults de `twiliofunction.js`)
 - `ONCALL_CONTACTS`: JSON opcional para nombre por número, por ejemplo:
 
 ```json
@@ -106,6 +112,30 @@ Flujo esperado:
 2. Dispara canales base (teléfono, SMS y Teams).
 3. En paralelo envía POST al aplicativo con el incidente y `called_number`.
 4. El aplicativo enlaza por número con `app_users` y muestra el usuario llamado en tiempo real.
+
+## Flujo de áreas y tags
+
+1. Admin crea áreas desde el panel (por ejemplo: Area SRE, Area Programacion) y define tags por área.
+2. Cada usuario debe quedar asociado a un `area_id`.
+3. `twiliofunction.js` detecta el área del incidente según los tags entrantes (`entityTags`) y envía `incident_area` al webhook.
+4. El webhook persiste `incident_area` y, cuando existe contexto de área, prioriza vincular usuario por número dentro de esa área.
+
+Ejemplo de `AREA_TAG_GROUPS_JSON`:
+
+```json
+{
+  "Area SRE": [
+    "custom_call_turno_observabilidad",
+    "custom:call_turno_observabilidad",
+    "call_turno_observabilidad"
+  ],
+  "Area Programacion": [
+    "custom_programacion",
+    "custom:_programacion",
+    "call_turno_progra"
+  ]
+}
+```
 
 ## Deploy en Netlify
 

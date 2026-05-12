@@ -133,12 +133,18 @@ label {
 }
 
 input,
+textarea,
 select,
 button {
   border-radius: 10px;
   border: 1px solid #7ab3dc66;
   padding: 10px 12px;
   font: inherit;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 96px;
 }
 
 button {
@@ -323,6 +329,14 @@ button:disabled {
   }
 
   50% {
+
+  #adminPanel h3 + form {
+    margin-top: 10px;
+  }
+
+  #adminPanel h3:not(:first-child) {
+    margin-top: 22px;
+  }
     transform: translateY(-14px);
   }
 }

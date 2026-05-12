@@ -22,10 +22,11 @@ exports.handler = async (event) => {
     const email = normalizeEmail(body.email);
     const password = String(body.password || '').trim();
     const phone = String(body.phone || '').trim();
+    const areaId = String(body.area_id || body.areaId || '').trim();
     const role = String(body.role || 'user').trim().toLowerCase();
 
-    if (!username || !email || !password || !phone) {
-      return json(400, { error: 'username, email, password and phone are required' });
+    if (!username || !email || !password || !phone || !areaId) {
+      return json(400, { error: 'username, email, password, phone and area_id are required' });
     }
 
     if (!['user', 'admin'].includes(role)) {
@@ -36,6 +37,25 @@ exports.handler = async (event) => {
     const phoneNormalized = normalizePhone(phone);
 
     const supabase = getSupabaseAdmin();
+
+    const { data: area, error: areaError } = await supabase
+      .from('areas')
+      .select('id, is_active')
+      .eq('id', areaId)
+      .maybeSingle();
+
+    if (areaError) {
+      return json(500, { error: 'Failed to validate area', details: areaError.message });
+    }
+
+    if (!area) {
+      return json(400, { error: 'Invalid area_id' });
+    }
+
+    if (!area.is_active) {
+      return json(400, { error: 'Selected area is inactive' });
+    }
+
     const { data, error } = await supabase
       .from('app_users')
       .insert({
@@ -44,10 +64,11 @@ exports.handler = async (event) => {
         password_hash: passwordHash,
         phone,
         phone_normalized: phoneNormalized,
+        area_id: areaId,
         role,
         is_active: true
       })
-      .select('id, username, email, role, phone, created_at, is_active')
+      .select('id, username, email, role, phone, area_id, area:areas(id, code, name), created_at, is_active')
       .single();
 
     if (error) {

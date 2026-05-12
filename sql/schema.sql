@@ -13,7 +13,20 @@ create table if not exists public.app_users (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.areas (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique,
+  name text not null unique,
+  tags text[] not null default '{}',
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists areas_code_idx on public.areas(code);
+create index if not exists areas_name_idx on public.areas(name);
+
 alter table public.app_users add column if not exists email text;
+alter table public.app_users add column if not exists area_id uuid references public.areas(id) on delete set null;
 update public.app_users
 set email = lower(username || '@local.invalid')
 where email is null or btrim(email) = '';
@@ -32,12 +45,16 @@ create table if not exists public.incidents (
   called_number text,
   called_user_id uuid references public.app_users(id) on delete set null,
   called_user_name text,
+  area_id uuid references public.areas(id) on delete set null,
+  incident_area text,
   incident_attended boolean not null default false,
   incident_attended_at timestamptz,
   created_at timestamptz not null default now()
 );
 
 alter table public.incidents add column if not exists problem_id text;
+alter table public.incidents add column if not exists area_id uuid references public.areas(id) on delete set null;
+alter table public.incidents add column if not exists incident_area text;
 alter table public.incidents add column if not exists incident_attended boolean;
 alter table public.incidents add column if not exists incident_attended_at timestamptz;
 update public.incidents set incident_attended = false where incident_attended is null;
@@ -47,13 +64,41 @@ alter table public.incidents alter column incident_attended set not null;
 create index if not exists incidents_created_at_idx on public.incidents(created_at desc);
 create index if not exists incidents_called_number_idx on public.incidents(called_number);
 create index if not exists incidents_problem_id_idx on public.incidents(problem_id);
+create index if not exists incidents_area_id_idx on public.incidents(area_id);
+
+insert into public.areas (code, name, tags, is_active)
+values
+  (
+    'SRE',
+    'Area SRE',
+    array['custom_call_turno_observabilidad', 'custom:call_turno_observabilidad', 'call_turno_observabilidad'],
+    true
+  ),
+  (
+    'PROGRAMACION',
+    'Area Programacion',
+    array['custom_programacion', 'custom:_programacion', 'call_turno_progra'],
+    true
+  )
+on conflict (code) do update
+set
+  name = excluded.name,
+  tags = excluded.tags,
+  is_active = true;
 
 alter table public.app_users enable row level security;
 alter table public.incidents enable row level security;
+alter table public.areas enable row level security;
 
 -- app_users solo por backend (service role)
 drop policy if exists app_users_no_access on public.app_users;
 create policy app_users_no_access on public.app_users
+for all
+using (false)
+with check (false);
+
+drop policy if exists areas_no_access on public.areas;
+create policy areas_no_access on public.areas
 for all
 using (false)
 with check (false);

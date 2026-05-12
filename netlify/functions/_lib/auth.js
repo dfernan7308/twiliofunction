@@ -18,7 +18,10 @@ const signToken = (user) => {
     username: user.username,
     email: user.email,
     role: user.role,
-    phone: user.phone || null
+    phone: user.phone || null,
+    area_id: user.area_id || null,
+    area_code: user.area && user.area.code ? user.area.code : null,
+    area_name: user.area && user.area.name ? user.area.name : null
   };
 
   return jwt.sign(tokenPayload, getJwtSecret(), {

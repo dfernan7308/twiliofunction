@@ -22,16 +22,36 @@ exports.handler = async (event) => {
     const username = String(body.username || '').trim();
     const email = normalizeEmail(body.email);
     const phone = String(body.phone || '').trim();
+    const areaId = String(body.area_id || body.areaId || '').trim();
     const role = String(body.role || '').trim().toLowerCase();
     const password = String(body.password || '').trim();
     const isActive = typeof body.is_active === 'boolean' ? body.is_active : true;
 
-    if (!id || !username || !email || !phone || !role) {
-      return json(400, { error: 'id, username, email, phone and role are required' });
+    if (!id || !username || !email || !phone || !role || !areaId) {
+      return json(400, { error: 'id, username, email, phone, role and area_id are required' });
     }
 
     if (!['user', 'admin'].includes(role)) {
       return json(400, { error: 'role must be user or admin' });
+    }
+
+    const supabase = getSupabaseAdmin();
+    const { data: area, error: areaError } = await supabase
+      .from('areas')
+      .select('id, is_active')
+      .eq('id', areaId)
+      .maybeSingle();
+
+    if (areaError) {
+      return json(500, { error: 'Failed to validate area', details: areaError.message });
+    }
+
+    if (!area) {
+      return json(400, { error: 'Invalid area_id' });
+    }
+
+    if (!area.is_active) {
+      return json(400, { error: 'Selected area is inactive' });
     }
 
     const updatePayload = {
@@ -39,6 +59,7 @@ exports.handler = async (event) => {
       email,
       phone,
       phone_normalized: normalizePhone(phone),
+      area_id: areaId,
       role,
       is_active: isActive
     };
@@ -47,12 +68,11 @@ exports.handler = async (event) => {
       updatePayload.password_hash = await hashPassword(password);
     }
 
-    const supabase = getSupabaseAdmin();
     const { data, error } = await supabase
       .from('app_users')
       .update(updatePayload)
       .eq('id', id)
-      .select('id, username, email, role, phone, created_at, is_active')
+      .select('id, username, email, role, phone, area_id, area:areas(id, code, name), created_at, is_active')
       .maybeSingle();
 
     if (error) {

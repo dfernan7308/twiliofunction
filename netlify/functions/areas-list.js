@@ -19,16 +19,15 @@ exports.handler = async (event) => {
   try {
     const supabase = getSupabaseAdmin();
     const { data, error } = await supabase
-      .from('incidents')
-      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, cause_name, affected_entity, area_id, incident_area, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
-      .order('created_at', { ascending: false })
-      .limit(200);
+      .from('areas')
+      .select('id, code, name, tags, is_active, created_at')
+      .order('name', { ascending: true });
 
     if (error) {
-      return json(500, { error: 'Failed to fetch incidents', details: error.message });
+      return json(500, { error: 'Failed to fetch areas', details: error.message });
     }
 
-    return json(200, { incidents: data || [] });
+    return json(200, { areas: data || [] });
   } catch (error) {
     return json(500, { error: 'Unexpected error', details: error.message });
   }

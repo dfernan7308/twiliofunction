@@ -20,7 +20,7 @@ exports.handler = async (event) => {
     const supabase = getSupabaseAdmin();
     const { data, error } = await supabase
       .from('app_users')
-      .select('id, username, email, role, phone, created_at, is_active')
+      .select('id, username, email, role, phone, area_id, area:areas(id, code, name), created_at, is_active')
       .order('created_at', { ascending: false });
 
     if (error) {

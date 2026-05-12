@@ -244,6 +244,27 @@ const parseJsonObject = (value) => {
     }
 };
 
+const resolveAreaTagGroupsFromContext = (context, payload) => {
+    const candidates = [
+        payload && payload.__areaTagGroups,
+        payload && payload.areaTagGroups,
+        payload && payload.area_tags_map,
+        payload && payload.areaTagsByArea,
+        payload && payload.areaTagGroupsJson,
+        context && context.AREA_TAG_GROUPS_JSON,
+        context && context.AREA_TAG_GROUPS
+    ];
+
+    for (const candidate of candidates) {
+        const parsed = parseAreaTagGroupsInput(candidate);
+        if (parsed) {
+            return parsed;
+        }
+    }
+
+    return DEFAULT_AREA_TAG_GROUPS;
+};
+
 const buildIncomingPayload = (event) => {
     const mergedPayload = { ...(event || {}) };
     const possiblePayloads = [event && event.payload, event && event.body, event && event.requestBody, event && event.data, event && event.rawBody];
@@ -425,6 +446,39 @@ const firstNonEmpty = (...values) => {
         const text = String(value).trim();
         if (text && text.toLowerCase() !== 'null' && text.toLowerCase() !== 'undefined') {
             return text;
+        }
+    }
+
+    return '';
+};
+
+const normalizeLooseKey = (value) => String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+const getPayloadValueByLooseKey = (payload, ...candidateKeys) => {
+    if (!payload || typeof payload !== 'object') {
+        return '';
+    }
+
+    const normalizedMap = new Map();
+    Object.entries(payload).forEach(([key, value]) => {
+        const normalizedKey = normalizeLooseKey(key);
+        if (normalizedKey && !normalizedMap.has(normalizedKey)) {
+            normalizedMap.set(normalizedKey, value);
+        }
+    });
+
+    for (const candidateKey of candidateKeys) {
+        const normalizedCandidate = normalizeLooseKey(candidateKey);
+        if (!normalizedCandidate) {
+            continue;
+        }
+
+        const candidateValue = normalizedMap.get(normalizedCandidate);
+        const extracted = firstNonEmpty(extractDisplayValue(candidateValue));
+        if (extracted) {
+            return extracted;
         }
     }
 
@@ -896,12 +950,89 @@ const normalizeTagSource = (source) => {
     return [source];
 };
 
-const hasObservabilityCriticalTag = (payload) => {
-    const normalizedNeedles = [
+const DEFAULT_AREA_TAG_GROUPS = Object.freeze({
+    'Area SRE': [
         'custom_call_turno_observabilidad',
         'custom:call_turno_observabilidad',
         'call_turno_observabilidad'
+    ],
+    'Area Programacion': [
+        'custom_programacion',
+        'custom:_programacion',
+        'call_turno_progra'
+    ]
+});
+
+const parseAreaTagGroupsInput = (value) => {
+    if (!value) {
+        return null;
+    }
+
+    let parsed = value;
+    if (typeof value === 'string') {
+        try {
+            parsed = JSON.parse(value);
+        } catch (error) {
+            return null;
+        }
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return null;
+    }
+
+    const normalizedGroups = {};
+    Object.entries(parsed).forEach(([areaName, tags]) => {
+        const normalizedAreaName = String(areaName || '').trim();
+        if (!normalizedAreaName) {
+            return;
+        }
+
+        const normalizedTags = normalizeTagSource(tags)
+            .map((tag) => String(tag || '').trim())
+            .filter(Boolean);
+
+        if (normalizedTags.length) {
+            normalizedGroups[normalizedAreaName] = normalizedTags;
+        }
+    });
+
+    return Object.keys(normalizedGroups).length ? normalizedGroups : null;
+};
+
+const getAreaTagGroups = (payload) => {
+    const candidates = [
+        payload && payload.__areaTagGroups,
+        payload && payload.areaTagGroups,
+        payload && payload.area_tags_map,
+        payload && payload.areaTagsByArea,
+        payload && payload.areaTagGroupsJson
     ];
+
+    for (const candidate of candidates) {
+        const parsed = parseAreaTagGroupsInput(candidate);
+        if (parsed) {
+            return parsed;
+        }
+    }
+
+    return DEFAULT_AREA_TAG_GROUPS;
+};
+
+const normalizeTagForMatching = (tagValue) => {
+    const normalizedTag = String(tagValue || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s\-./]+/g, '_')
+        .replace(/:+/g, ':');
+
+    return {
+        normalizedTag,
+        normalizedTagLoose: normalizedTag.replace(/[:_]/g, '')
+    };
+};
+
+const getPayloadNormalizedTags = (payload) => {
     const tagSources = [
         payload.entityTags,
         payload.EntityTags,
@@ -913,27 +1044,80 @@ const hasObservabilityCriticalTag = (payload) => {
         payload.tag
     ].filter(Boolean);
 
-    return tagSources.some((source) => {
-        const tags = normalizeTagSource(source);
-        return tags.some((tag) => {
+    const normalizedTags = [];
+
+    tagSources.forEach((source) => {
+        normalizeTagSource(source).forEach((tag) => {
             const tagText = typeof tag === 'object'
                 ? firstNonEmpty(tag.stringRepresentation, tag.key, tag.value, tag.name, tag.tag, `${tag.context || ''}:${tag.key || ''}`)
                 : String(tag || '');
 
-            const normalizedTag = tagText
-                .trim()
-                .toLowerCase()
-                .replace(/[\s\-./]+/g, '_')
-                .replace(/:+/g, ':');
-            const normalizedTagLoose = normalizedTag.replace(/[:_]/g, '');
+            if (!tagText) {
+                return;
+            }
 
-            return normalizedNeedles.some((needle) => {
-                const normalizedNeedle = needle.toLowerCase();
-                const normalizedNeedleLoose = normalizedNeedle.replace(/[:_]/g, '');
-                return normalizedTag.includes(normalizedNeedle) || normalizedTagLoose.includes(normalizedNeedleLoose);
-            });
+            normalizedTags.push(normalizeTagForMatching(tagText));
         });
     });
+
+    return normalizedTags;
+};
+
+const getAreaTagMatches = (payload) => {
+    const areaTagGroups = getAreaTagGroups(payload);
+    const payloadTags = getPayloadNormalizedTags(payload);
+    const matches = {};
+
+    Object.entries(areaTagGroups).forEach(([areaName, areaNeedles]) => {
+        const areaMatches = [];
+
+        areaNeedles.forEach((needle) => {
+            const normalizedNeedle = String(needle || '').trim().toLowerCase();
+            if (!normalizedNeedle) {
+                return;
+            }
+
+            const normalizedNeedleLoose = normalizedNeedle.replace(/[:_]/g, '');
+            const matched = payloadTags.some((tagInfo) => {
+                return tagInfo.normalizedTag.includes(normalizedNeedle)
+                    || tagInfo.normalizedTagLoose.includes(normalizedNeedleLoose);
+            });
+
+            if (matched) {
+                areaMatches.push(needle);
+            }
+        });
+
+        if (areaMatches.length) {
+            matches[areaName] = areaMatches;
+        }
+    });
+
+    return matches;
+};
+
+const getResolvedIncidentArea = (payload) => {
+    const explicitArea = firstNonEmpty(
+        payload.incidentArea,
+        payload.incident_area,
+        payload.area,
+        payload.areaName,
+        payload.area_name,
+        payload.areaCode,
+        payload.area_code
+    );
+
+    if (explicitArea) {
+        return cleanForSpeech(explicitArea);
+    }
+
+    const areaMatches = getAreaTagMatches(payload);
+    const firstMatchedArea = Object.keys(areaMatches)[0] || '';
+    return cleanForSpeech(firstMatchedArea);
+};
+
+const hasObservabilityCriticalTag = (payload) => {
+    return Object.keys(getAreaTagMatches(payload)).length > 0;
 };
 
 const getNormalizedSeverity = (payload) => firstNonEmpty(
@@ -972,8 +1156,11 @@ const getEffectiveCriticality = (payload) => {
 };
 
 const getRootCauseValue = (payload) => firstNonEmpty(
+    getPayloadValueByLooseKey(payload, 'ProblemRootCause', 'problemRootCause', 'problem_root_cause', 'problemrootcause'),
     extractDisplayValue(payload.ProblemRootCause),
     extractDisplayValue(payload.problemRootCause),
+    extractDisplayValue(payload.problem_root_cause),
+    extractDisplayValue(payload.problemrootcause),
     extractDisplayValue(payload.Causa),
     extractDisplayValue(payload.causa),
     extractDisplayValue(payload.causeName),
@@ -995,8 +1182,11 @@ const getRootCauseValue = (payload) => firstNonEmpty(
 );
 
 const getAffectedEntityValue = (payload) => firstNonEmpty(
+    getPayloadValueByLooseKey(payload, 'ProblemImpact', 'problemImpact', 'problem_impact', 'problemimpact'),
     extractDisplayValue(payload.ProblemImpact),
     extractDisplayValue(payload.problemImpact),
+    extractDisplayValue(payload.problem_impact),
+    extractDisplayValue(payload.problemimpact),
     extractDisplayValue(payload.ImpactedEntity),
     extractDisplayValue(payload.impactedEntity),
     extractDisplayValue(payload.EntidadAfectada),
@@ -1309,6 +1499,7 @@ const buildIncidentSummary = (event, problemId) => {
         extractDisplayValue(event.servicio)
     ));
     const affectedEntity = cleanForSpeech(getAffectedEntityValue(event));
+    const incidentArea = cleanForSpeech(getResolvedIncidentArea(event));
     const monitorName = cleanForSpeech(firstNonEmpty(extractDisplayValue(event.monitorName), getMonitorNameValue(event)));
     const webRequestService = cleanForSpeech(firstNonEmpty(extractDisplayValue(event.webRequestService), getWebRequestServiceValue(event)));
     const webService = cleanForSpeech(firstNonEmpty(extractDisplayValue(event.webService), getWebServiceValue(event)));
@@ -1341,6 +1532,7 @@ const buildIncidentSummary = (event, problemId) => {
         criticality ? `Criticidad ${criticality}.` : '',
         `Incidente ${displayId}.`,
         title ? `${title}.` : '',
+        incidentArea ? `Área ${incidentArea}.` : '',
         causeName ? `Causa ${causeName}.` : '',
         affectedEntity ? `Entidad afectada ${affectedEntity}.` : '',
         webRequestService ? `Web request service ${webRequestService}.` : '',
@@ -1355,6 +1547,7 @@ const buildIncidentSummary = (event, problemId) => {
         `[Dynatrace ${priority}/${category}]`,
         problemId ? `ID: ${problemId}` : '',
         title,
+        incidentArea ? `Area: ${incidentArea}` : '',
         criticality ? `Criticidad: ${criticality}` : '',
         causeName ? `Causa: ${causeName}` : '',
         affectedEntity ? `Entidad: ${affectedEntity}` : '',
@@ -1374,6 +1567,7 @@ const buildIncidentSummary = (event, problemId) => {
         serviceName: causeName,
         causeName,
         affectedEntity,
+        incidentArea,
         monitorName,
         webRequestService,
         webService,
@@ -1554,6 +1748,7 @@ const buildTeamsPayload = (incidentSummary, event, problemId) => {
                     { name: 'Prioridad', value: incidentSummary.priority },
                     { name: 'Severidad', value: getNormalizedSeverity(event) || 'N/D' },
                     { name: 'Estado', value: status },
+                    { name: 'Area', value: incidentSummary.incidentArea || 'N/D' },
                     { name: 'Causa', value: causeName || 'N/D' },
                     { name: 'Entidad afectada', value: incidentSummary.affectedEntity || 'N/D' },
                     { name: 'Zona', value: incidentSummary.managementZone || 'N/D' },
@@ -1803,6 +1998,38 @@ const postIncidentToApp = async ({
         return { delivered: false, reason: 'missing_app_webhook_url' };
     }
 
+    const resolvedCauseName = firstNonEmpty(
+        incidentSummary.causeName,
+        getRootCauseValue(payload),
+        extractDisplayValue(payload.cause_name),
+        extractDisplayValue(payload.causeName),
+        extractDisplayValue(payload.ProblemRootCause),
+        extractDisplayValue(payload.problemRootCause),
+        getPayloadValueByLooseKey(payload, 'ProblemRootCause', 'problemRootCause', 'problem_root_cause', 'problemrootcause')
+    );
+
+    const resolvedAffectedEntity = firstNonEmpty(
+        incidentSummary.affectedEntity,
+        getAffectedEntityValue(payload),
+        extractDisplayValue(payload.affected_entity),
+        extractDisplayValue(payload.affectedEntity),
+        extractDisplayValue(payload.ProblemImpact),
+        extractDisplayValue(payload.problemImpact),
+        getPayloadValueByLooseKey(payload, 'ProblemImpact', 'problemImpact', 'problem_impact', 'problemimpact')
+    );
+
+    const resolvedIncidentArea = firstNonEmpty(
+        incidentSummary.incidentArea,
+        getResolvedIncidentArea(payload),
+        extractDisplayValue(payload.incident_area),
+        extractDisplayValue(payload.incidentArea),
+        extractDisplayValue(payload.area),
+        extractDisplayValue(payload.area_name),
+        extractDisplayValue(payload.areaName),
+        extractDisplayValue(payload.area_code),
+        extractDisplayValue(payload.areaCode)
+    );
+
     const body = {
         incident_title: incidentSummary.title,
         incident_status: firstNonEmpty(callStatus, payload.status, payload.State, payload.state, payload.problemStatus, payload['event.status'], 'OPEN'),
@@ -1815,8 +2042,9 @@ const postIncidentToApp = async ({
         priority: incidentSummary.priority,
         category: incidentSummary.category,
         criticality: incidentSummary.criticality,
-        cause_name: incidentSummary.causeName,
-        affected_entity: incidentSummary.affectedEntity,
+        cause_name: resolvedCauseName,
+        affected_entity: resolvedAffectedEntity,
+        incident_area: resolvedIncidentArea,
         source: 'twilio-function',
         channels: {
             phone: Boolean(phoneSent),
@@ -1824,6 +2052,13 @@ const postIncidentToApp = async ({
             teams: Boolean(teamsSent)
         }
     };
+
+    console.log('Resolved incident fields for app webhook:', JSON.stringify({
+        problem_id: problemId,
+        cause_name: body.cause_name || null,
+        affected_entity: body.affected_entity || null,
+        incident_area: body.incident_area || null
+    }));
 
     const response = await fetchWithTimeoutAndRetry(appWebhookUrl, {
         method: 'POST',
@@ -2036,6 +2271,10 @@ const getDuePendingRetries = async ({ client, syncServiceSid }) => {
 
 exports.handler = async function (context, event, callback) {
     let payload = buildIncomingPayload(event);
+    payload = {
+        ...payload,
+        __areaTagGroups: resolveAreaTagGroupsFromContext(context, payload)
+    };
     let enrichedProblemDetails = null;
     const client = require('twilio')(context.ACCOUNT_SID, context.AUTH_TOKEN);
     const debugEnabled = isDebugEnabled(context.DEBUG_DYNATRACE_PAYLOAD || payload.debugDynatracePayload);
@@ -2226,6 +2465,9 @@ exports.handler = async function (context, event, callback) {
         console.log('Dynatrace payload keys:', JSON.stringify(getObjectKeys(payload)));
         console.log('Dynatrace entity tags:', JSON.stringify(payload.entityTags || payload.EntityTags || payload.tags || payload.entity_tags || payload['Entity tags'] || []));
         console.log('Dynatrace observability tag detected:', hasObservabilityCriticalTag(payload));
+        console.log('Dynatrace area tag groups:', JSON.stringify(getAreaTagGroups(payload)));
+        console.log('Dynatrace area matches:', JSON.stringify(getAreaTagMatches(payload)));
+        console.log('Dynatrace resolved area:', getResolvedIncidentArea(payload) || '[empty]');
         console.log('Teams webhook configured:', Boolean(teamsWebhookUrl));
         console.log('Teams webhook length:', teamsWebhookUrl ? teamsWebhookUrl.length : 0);
         console.log('Dynatrace resolved cause:', getRootCauseValue(payload) || '[empty]');
@@ -2247,7 +2489,8 @@ exports.handler = async function (context, event, callback) {
         severity: getNormalizedSeverity(payload),
         priority: incidentSummary.priority,
         causeName: incidentSummary.causeName || incidentSummary.serviceName,
-        affectedEntity: incidentSummary.affectedEntity
+        affectedEntity: incidentSummary.affectedEntity,
+        incidentArea: incidentSummary.incidentArea || ''
     }));
 
     if (!fromNumber || !functionBaseUrl) {
@@ -3558,6 +3801,7 @@ exports.handler = async function (context, event, callback) {
                 priority: incidentSummary.priority,
                 title: incidentSummary.title,
                 affectedEntity: incidentSummary.affectedEntity,
+                incidentArea: incidentSummary.incidentArea || '',
                 sourceStatus: firstNonEmpty(payload.status, payload.State, payload.state, payload.problemStatus, payload['event.status']) || 'OPEN'
             }
         });

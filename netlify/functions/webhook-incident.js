@@ -96,6 +96,8 @@ exports.handler = async (event) => {
     const incidentSeverity = firstNonEmpty(body.incident_severity, body.severity, body.priority, 'UNKNOWN');
     const incidentStatus = firstNonEmpty(body.incident_status, body.status, 'OPEN');
     const incidentDescription = firstNonEmpty(body.incident_description, body.description, body.details, body.message);
+    const causeName = firstNonEmpty(body.cause_name, body.causeName, body.rootCause, body.ProblemRootCause, body.problemRootCause);
+    const affectedEntity = firstNonEmpty(body.affected_entity, body.affectedEntity, body.impactedEntity, body.ProblemImpact, body.problemImpact);
 
     const normalized = normalizePhone(calledNumber);
     const calledNumberNormalized = normalized;
@@ -159,7 +161,7 @@ exports.handler = async (event) => {
         .from('incidents')
         .update(updatePayload)
         .eq('id', latestIncident.id)
-        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
         .single();
 
       if (updateError) {
@@ -195,7 +197,7 @@ exports.handler = async (event) => {
 
       const { data: latestIncident, error: latestIncidentError } = await supabase
         .from('incidents')
-        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
         .eq('problem_id', problemId)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -238,7 +240,7 @@ exports.handler = async (event) => {
         })
         .eq('id', latestIncident.id)
         .eq('incident_status', currentStatus)
-        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
         .maybeSingle();
 
       if (reserveError) {
@@ -248,7 +250,7 @@ exports.handler = async (event) => {
       if (!reservedIncident) {
         const { data: refreshedIncident, error: refreshedIncidentError } = await supabase
           .from('incidents')
-          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, created_at')
+          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
           .eq('id', latestIncident.id)
           .maybeSingle();
 
@@ -316,7 +318,9 @@ exports.handler = async (event) => {
       called_user_id: matchedUser ? matchedUser.id : null,
       called_user_name: matchedUser ? matchedUser.username : null,
       incident_attended: incidentAttended,
-      incident_attended_at: incidentAttended ? new Date().toISOString() : null
+      incident_attended_at: incidentAttended ? new Date().toISOString() : null,
+      ...(causeName ? { cause_name: causeName } : {}),
+      ...(affectedEntity ? { affected_entity: affectedEntity } : {})
     };
 
     // Idempotency guard: repeated webhook deliveries for the same problem must not create
@@ -324,7 +328,7 @@ exports.handler = async (event) => {
     if (problemId) {
       const { data: existingIncident, error: existingIncidentError } = await supabase
         .from('incidents')
-        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+        .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
         .eq('problem_id', problemId)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -359,7 +363,7 @@ exports.handler = async (event) => {
 
     const { data: recentCandidates, error: recentCandidatesError } = await supabase
       .from('incidents')
-      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
       .eq('incident_title', incidentTitle)
       .eq('incident_severity', incidentSeverity)
       .gte('created_at', dedupeSince)
@@ -412,7 +416,7 @@ exports.handler = async (event) => {
     const { data: created, error: incidentError } = await supabase
       .from('incidents')
       .insert(incidentPayload)
-      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+      .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
       .single();
 
     if (incidentError) {
@@ -421,7 +425,7 @@ exports.handler = async (event) => {
       if (problemId && isDuplicateKey) {
         const { data: existingAfterConflict, error: conflictLookupError } = await supabase
           .from('incidents')
-          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, created_at')
+          .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
           .eq('problem_id', problemId)
           .order('created_at', { ascending: false })
           .limit(1)

@@ -1353,6 +1353,7 @@ const buildIncidentSummary = (event, problemId) => {
 
     const smsParts = [
         `[Dynatrace ${priority}/${category}]`,
+        problemId ? `ID: ${problemId}` : '',
         title,
         criticality ? `Criticidad: ${criticality}` : '',
         causeName ? `Causa: ${causeName}` : '',
@@ -1978,6 +1979,61 @@ const postMonitoringEvent = async ({ monitoringBackendUrls, ingestToken, eventTy
     }
 };
 
+// ─── Retry Scheduling Helpers (Twilio Sync) ────────────────────────────────
+
+const scheduleRetry = async ({ client, syncServiceSid, problemId, level, attempt, toNumber, delayMinutes }) => {
+    if (!syncServiceSid) {
+        console.log('[RETRY] SYNC_SERVICE_SID not configured, skipping retry schedule');
+        return false;
+    }
+    const retryAt = Date.now() + (delayMinutes * 60 * 1000);
+    const itemKey = `retry:${problemId}:L${level}:A${attempt + 1}`;
+    try {
+        await client.sync.v1.services(syncServiceSid)
+            .syncMaps('pending_retries')
+            .syncMapItems
+            .create({
+                key: itemKey,
+                data: {
+                    problemId,
+                    level: String(level),
+                    attempt: attempt + 1,
+                    toNumber,
+                    retryAt,
+                    scheduledAt: Date.now(),
+                    status: 'pending'
+                },
+                ttl: 86400
+            });
+        console.log(`[RETRY] Scheduled retry: ${itemKey} at ${new Date(retryAt).toISOString()}`);
+        return true;
+    } catch (err) {
+        if (err.code === 54208) {
+            console.log(`[RETRY] Retry already exists for ${itemKey}, skipping`);
+            return false;
+        }
+        console.log(`[RETRY] Failed to schedule retry: ${err.message}`);
+        return false;
+    }
+};
+
+const getDuePendingRetries = async ({ client, syncServiceSid }) => {
+    if (!syncServiceSid) return [];
+    try {
+        const items = await client.sync.v1.services(syncServiceSid)
+            .syncMaps('pending_retries')
+            .syncMapItems
+            .list({ limit: 50 });
+        const now = Date.now();
+        return items.filter(item => item.data && item.data.status === 'pending' && item.data.retryAt <= now + 60000);
+    } catch (err) {
+        console.log(`[RETRY] Failed to read pending retries: ${err.message}`);
+        return [];
+    }
+};
+
+// ────────────────────────────────────────────────────────────────────────────
+
 exports.handler = async function (context, event, callback) {
     let payload = buildIncomingPayload(event);
     let enrichedProblemDetails = null;
@@ -2004,7 +2060,7 @@ exports.handler = async function (context, event, callback) {
     );
 
     const problemId = resolveProblemId(payload);
-    const mode = firstNonEmpty(payload.mode, event.mode, 'start').toLowerCase();
+    const mode = firstNonEmpty(event.mode, payload.mode, 'start').toLowerCase();
     const hasCallbackCallSid = Boolean(firstNonEmpty(event.CallSid, payload.CallSid, payload.callSid));
     const hasExplicitMode = Boolean(firstNonEmpty(payload.mode, event.mode));
     const level = payload.level || '1';
@@ -2037,7 +2093,7 @@ exports.handler = async function (context, event, callback) {
         : singleDialPerLevelWindowSeconds;
     const flowLockTtlSeconds = asPositiveInt(firstNonEmpty(context.FLOW_LOCK_TTL_SECONDS, payload.flowLockTtlSeconds, '1800'), 1800);
     const flowLockTtlMs = Math.max(1000, flowLockTtlSeconds * 1000);
-    const ackMaxReplays = asPositiveInt(firstNonEmpty(context.ACK_MAX_REPLAYS, payload.ackMaxReplays, '2'), 2);
+    const ackMaxReplays = asPositiveInt(firstNonEmpty(context.ACK_MAX_REPLAYS, payload.ackMaxReplays, '0'), 0);
     const callMessageVoice = firstNonEmpty(context.TWILIO_MESSAGE_VOICE, context.TWILIO_VOICE, payload.messageVoice, 'Polly.Lupe-Generative');
     const callMessageLanguage = firstNonEmpty(context.TWILIO_MESSAGE_LANGUAGE, context.TWILIO_LANGUAGE, payload.messageLanguage, 'es-MX');
     const amdStatusCallbackBaseUrl = firstNonEmpty(
@@ -2100,7 +2156,7 @@ exports.handler = async function (context, event, callback) {
         event.forceDialGuardBypass,
         'false'
     ), false);
-    const dialGuardBypassActive = isSmokeLikeProblemId && allowSmokeDialGuardBypass && requestDialGuardBypass;
+    const dialGuardBypassActive = allowSmokeDialGuardBypass && requestDialGuardBypass;
     const smokeWindowApplied = isSmokeLikeProblemId && hasExplicitSingleDialSmokeWindow;
     const effectiveSingleDialWindowSeconds = smokeWindowApplied
         ? Math.min(singleDialPerLevelWindowSeconds, singleDialSmokeWindowSeconds)
@@ -2216,6 +2272,7 @@ exports.handler = async function (context, event, callback) {
     const dial = async (toNumber, nextLevel, nextAttempt, nextIndex, options = {}) => {
         const smsSent = Boolean(options.smsSent);
         const teamsSent = Boolean(options.teamsSent);
+        const targetProblemId = options.targetProblemId || problemId;
         const isEscalationDial = String(nextLevel) !== '1';
         const includeRecentLookupForDial = enforceRecentWindowGuard || (smokeEscalationRecentGuardActive && isEscalationDial);
         const dialGuardWindowSeconds = includeRecentLookupForDial
@@ -2227,7 +2284,7 @@ exports.handler = async function (context, event, callback) {
                         : recentDialGuardWindowSeconds)
             )
             : recentDialGuardWindowSeconds;
-        const shouldRunDialGuard = (enableActiveDialGuard || includeRecentLookupForDial) && !dialGuardBypassActive;
+        const shouldRunDialGuard = (enableActiveDialGuard || includeRecentLookupForDial) && !dialGuardBypassActive && !options.bypassGuard;
         const sayMessage = nextLevel === '2' ? level2Message : message;
 
         if (dialGuardBypassActive) {
@@ -2253,7 +2310,7 @@ exports.handler = async function (context, event, callback) {
             });
 
             logCallStatusTrace(traceCallStatus, 'dial_guard_probe', {
-                problemId,
+                problemId: targetProblemId,
                 level: nextLevel,
                 attempt: nextAttempt,
                 levelIndex: nextIndex,
@@ -2291,7 +2348,7 @@ exports.handler = async function (context, event, callback) {
             payload,
             {
                 mode: 'amd',
-                problemId,
+                problemId: targetProblemId,
                 level: nextLevel,
                 attempt: nextAttempt,
                 levelIndex: nextIndex,
@@ -2300,7 +2357,7 @@ exports.handler = async function (context, event, callback) {
         );
         const ackActionUrl = buildAckActionUrl({
             functionBaseUrl,
-            problemId,
+            problemId: targetProblemId,
             level: nextLevel,
             attempt: nextAttempt,
             levelIndex: nextIndex,
@@ -2309,7 +2366,7 @@ exports.handler = async function (context, event, callback) {
         });
         const statusCallbackUrl = buildStatusCallbackUrl({
             functionBaseUrl,
-            problemId,
+            problemId: targetProblemId,
             level: nextLevel,
             attempt: nextAttempt,
             levelIndex: nextIndex,
@@ -2341,14 +2398,14 @@ exports.handler = async function (context, event, callback) {
             } : {}),
             statusCallback: statusCallbackUrl,
             statusCallbackMethod: 'POST',
-            statusCallbackEvent: ['completed']
+            statusCallbackEvent: ['completed', 'no-answer', 'busy', 'failed', 'canceled']
         });
 
         await postMonitoringEvent({
             monitoringBackendUrls,
             ingestToken: monitoringIngestToken,
             eventType: 'call_initiated',
-            problemId,
+            problemId: targetProblemId,
             payload: {
                 callSid: call.sid,
                 specialistPhone: toNumber,
@@ -2362,7 +2419,7 @@ exports.handler = async function (context, event, callback) {
             }
         });
 
-        return call;
+        return { sent: true, call };
     };
 
     const sendSms = async (toNumber, nextLevel, nextAttempt, callStatus) => {
@@ -2382,7 +2439,8 @@ exports.handler = async function (context, event, callback) {
             });
             return false;
         }
-        const safeSmsMessage = truncateText(smsMessage, 150);
+        const smsMessageWithLevel = `${smsMessage}\n[L${nextLevel}A${nextAttempt}]`;
+        const safeSmsMessage = truncateText(smsMessageWithLevel, 150);
         console.log(`Sending SMS to ${toNumber} for level ${nextLevel} attempt ${nextAttempt} (status ${callStatus}) with ${safeSmsMessage.length} chars`);
         const result = await client.messages.create({
             to: toNumber,
@@ -2427,11 +2485,28 @@ exports.handler = async function (context, event, callback) {
         }
     };
 
-    const tryDial = async (toNumber, nextLevel, nextAttempt, nextIndex) => {
+    const tryDial = async (toNumber, nextLevel, nextAttempt, nextIndex, targetProblemId = problemId, bypassGuard = false) => {
+        if (smsFromNumber && targetProblemId && targetProblemId !== 'unknown') {
+            try {
+                const recentSms = await client.messages.list({ to: toNumber, limit: 10 });
+                const alreadyProcessed = recentSms.some(msg => 
+                    msg.body && msg.body.includes(`ID: ${targetProblemId}`) && msg.body.includes(`[L${nextLevel}A${nextAttempt}]`)
+                );
+                if (alreadyProcessed) {
+                    console.log(`[DEDUPLICATOR] Call to level ${nextLevel} for ${targetProblemId} aborted: SMS already sent!`);
+                    return { sent: false, duplicateBlocked: true, reason: 'sms_deduplication_lock_matched' };
+                }
+            } catch (err) {
+                console.log(`[DEDUPLICATOR] SMS deduplication check failed: ${err.message}`);
+            }
+        }
+
         try {
             await dial(toNumber, nextLevel, nextAttempt, nextIndex, {
+                targetProblemId,
                 smsSent: false,
-                teamsSent: false
+                teamsSent: false,
+                bypassGuard
             });
             return {
                 sent: true,
@@ -2455,7 +2530,7 @@ exports.handler = async function (context, event, callback) {
                 const duplicateDialDiagnostics = error.duplicateDialDiagnostics || null;
                 console.log(`Dial blocked by duplicate guard: ${duplicateDialReason}. Hint: ${duplicateDialHint}`);
                 console.log(`[DIAL_GUARD_DIAG] ${JSON.stringify({
-                    problemId,
+                    problemId: targetProblemId,
                     toNumber,
                     fromNumber,
                     level: nextLevel,
@@ -2472,7 +2547,7 @@ exports.handler = async function (context, event, callback) {
                     monitoringBackendUrls,
                     ingestToken: monitoringIngestToken,
                     eventType: 'call_duplicate_blocked_pre_dial',
-                    problemId,
+                    problemId: targetProblemId,
                     payload: {
                         specialistPhone: toNumber,
                         callStatus: 'blocked',
@@ -2505,7 +2580,7 @@ exports.handler = async function (context, event, callback) {
                 monitoringBackendUrls,
                 ingestToken: monitoringIngestToken,
                 eventType: 'call_failed',
-                problemId,
+                problemId: targetProblemId,
                 payload: {
                     specialistPhone: toNumber,
                     callStatus: 'failed',
@@ -2802,6 +2877,64 @@ exports.handler = async function (context, event, callback) {
             return callback(null, 'Ignored start request carrying CallSid');
         }
 
+        if (mode === 'retry') {
+            const cronSecret = firstNonEmpty(event.cronSecret, payload.cronSecret);
+            const expectedSecret = context.RETRY_CRON_SECRET;
+            if (expectedSecret && cronSecret !== expectedSecret) {
+                console.log('[RETRY] Unauthorized retry attempt — bad cronSecret');
+                return callback(null, 'Unauthorized');
+            }
+
+            const syncServiceSid = context.SYNC_SERVICE_SID;
+            const retryDelayMinutes = asPositiveInt(firstNonEmpty(context.RETRY_DELAY_MINUTES, '30'), 30);
+
+            const dueRetries = await getDuePendingRetries({ client, syncServiceSid });
+            console.log(`[RETRY] Found ${dueRetries.length} due retries`);
+
+            for (const item of dueRetries) {
+                const { problemId: rProblemId, level: rLevel, attempt: rAttempt, toNumber: rTo } = item.data;
+
+                // Marcar como procesando para evitar doble ejecución
+                try {
+                    await client.sync.v1.services(syncServiceSid)
+                        .syncMaps('pending_retries')
+                        .syncMapItems(item.key)
+                        .update({ data: { ...item.data, status: 'processing' } });
+                } catch (lockErr) {
+                    console.log(`[RETRY] Could not lock item ${item.key}: ${lockErr.message}`);
+                    continue;
+                }
+
+                const maxLevel1Attempts = asPositiveInt(firstNonEmpty(context.MAX_LEVEL1_ATTEMPTS, '3'), 3);
+                const maxLevel2Attempts = asPositiveInt(firstNonEmpty(context.MAX_LEVEL2_ATTEMPTS, '3'), 3);
+                const maxAttemptsForLevel = String(rLevel) === '1' ? maxLevel1Attempts : maxLevel2Attempts;
+                console.log(`[RETRY] Processing: ${item.key} (L${rLevel} attempt ${rAttempt}/${maxAttemptsForLevel})`);
+
+                try {
+                    const dialResult = await tryDial(rTo, rLevel, rAttempt, 0, rProblemId, true);
+                    if (dialResult && dialResult.sent) {
+                        console.log(`[RETRY] Call initiated for ${item.key}`);
+                    } else {
+                        console.log(`[RETRY] Dial skipped or failed for ${item.key}`);
+                    }
+                } catch (callErr) {
+                    console.log(`[RETRY] Call failed for ${item.key}: ${callErr.message}`);
+                }
+
+                // Eliminar item procesado del Sync
+                try {
+                    await client.sync.v1.services(syncServiceSid)
+                        .syncMaps('pending_retries')
+                        .syncMapItems(item.key)
+                        .remove();
+                } catch (rmErr) {
+                    console.log(`[RETRY] Could not remove item ${item.key}: ${rmErr.message}`);
+                }
+            }
+
+            return callback(null, `Retry checker processed ${dueRetries.length} items`);
+        }
+
         if (mode === 'amd') {
             const callSid = firstNonEmpty(event.CallSid, payload.CallSid);
             const toNumber = firstNonEmpty(event.To, payload.to, payload.To);
@@ -2924,11 +3057,9 @@ exports.handler = async function (context, event, callback) {
 
             const amdClassification = classifyAmdResult(answeredBy);
             const ackConfirmed = ackConfirmedFromStatusCallback || ackConfirmedFromMemory;
-            const callbackEscalationCandidate = String(level) === '1' && (
-                requireDtmfAck
-                    ? shouldRetryCall(callStatus)
-                    : shouldContinueEscalation(callStatus, answeredBy)
-            );
+            const callbackEscalationCandidate = requireDtmfAck
+                ? shouldRetryCall(callStatus)
+                : shouldContinueEscalation(callStatus, answeredBy);
             const shouldEscalateFromCallback = callbackEscalationCandidate && !effectiveDisableSmokeEscalation;
 
             logCallStatusTrace(traceCallStatus, 'callback_decision', {
@@ -2950,19 +3081,70 @@ exports.handler = async function (context, event, callback) {
             });
 
             if (shouldEscalateFromCallback) {
-                const escalationResult = await escalateFromLevel({
-                    currentLevel: level,
-                    currentAttempt: attempt,
-                    currentLevelIndex: levelIndex,
-                    callStatus: firstNonEmpty(callStatus, 'unknown'),
-                    reason: requireDtmfAck ? 'callback_requires_escalation' : 'callback_retry_escalation'
-                });
+                const syncServiceSid = context.SYNC_SERVICE_SID;
+                const maxLevel1Attempts = asPositiveInt(firstNonEmpty(context.MAX_LEVEL1_ATTEMPTS, '3'), 3);
+                const maxLevel2Attempts = asPositiveInt(firstNonEmpty(context.MAX_LEVEL2_ATTEMPTS, '3'), 3);
+                const retryDelayMinutes = asPositiveInt(firstNonEmpty(context.RETRY_DELAY_MINUTES, '30'), 30);
+                const maxAttemptsForCurrentLevel = String(level) === '1' ? maxLevel1Attempts : maxLevel2Attempts;
 
-                if (escalationResult.escalated) {
-                    return callback(null, `Escalated from level ${level} to level ${escalationResult.level}`);
+                if (attempt < maxAttemptsForCurrentLevel) {
+                    // Hay más intentos disponibles → agendar reintento
+                    const scheduled = await scheduleRetry({
+                        client, syncServiceSid, problemId,
+                        level, attempt, toNumber,
+                        delayMinutes: retryDelayMinutes
+                    });
+                    console.log(`[RETRY] ${scheduled ? 'Scheduled' : 'Already scheduled'}: L${level} retry ${attempt + 1} in ${retryDelayMinutes} min`);
+                    await postMonitoringEvent({
+                        monitoringBackendUrls,
+                        ingestToken: monitoringIngestToken,
+                        eventType: 'retry_scheduled',
+                        problemId,
+                        payload: {
+                            specialistPhone: toNumber,
+                            callStatus: firstNonEmpty(callStatus, 'unknown'),
+                            level,
+                            attempt,
+                            nextAttempt: attempt + 1,
+                            retryDelayMinutes,
+                            scheduled
+                        }
+                    });
+                    return callback(null, `Retry scheduled: L${level} attempt ${attempt + 1} in ${retryDelayMinutes} min`);
                 }
 
-                return callback(null, `Escalation from level ${level} skipped: ${escalationResult.reason || 'unknown'}`);
+                // Agotados intentos de nivel 1 → escalar a nivel 2
+                if (String(level) === '1' && level2List[0]) {
+                    console.log(`[RETRY] Level 1 exhausted (${maxLevel1Attempts} attempts) → escalating to Level 2 immediately`);
+                    const escalationResult = await escalateFromLevel({
+                        currentLevel: level,
+                        currentAttempt: attempt,
+                        currentLevelIndex: levelIndex,
+                        callStatus: firstNonEmpty(callStatus, 'unknown'),
+                        reason: 'max_level1_attempts_reached'
+                    });
+                    if (escalationResult && escalationResult.escalated) {
+                        return callback(null, `Escalated to Level 2 after ${maxLevel1Attempts} Level 1 attempts`);
+                    }
+                    return callback(null, `Level 2 escalation skipped: ${(escalationResult && escalationResult.reason) || 'unknown'}`);
+                }
+
+                // Agotados intentos de nivel 2 → fin del flujo
+                console.log(`[RETRY] Level ${level} exhausted (${maxAttemptsForCurrentLevel} attempts) → incident closed, no more escalation`);
+                await postMonitoringEvent({
+                    monitoringBackendUrls,
+                    ingestToken: monitoringIngestToken,
+                    eventType: 'escalation_exhausted',
+                    problemId,
+                    payload: {
+                        specialistPhone: toNumber,
+                        callStatus: firstNonEmpty(callStatus, 'unknown'),
+                        level,
+                        attempt,
+                        reason: 'max_attempts_reached_all_levels'
+                    }
+                });
+                return callback(null, `Max attempts reached for Level ${level} — incident escalation complete`);
             }
 
             if (!requireDtmfAck && shouldTreatCallAsHuman(callStatus, answeredBy)) {
@@ -3217,13 +3399,33 @@ exports.handler = async function (context, event, callback) {
 
             let escalationResult = null;
             if (String(level) === '1' && !callbackOwnsEscalation && !effectiveDisableSmokeEscalation) {
-                escalationResult = await escalateFromLevel({
-                    currentLevel: level,
-                    currentAttempt: attempt,
-                    currentLevelIndex: levelIndex,
-                    callStatus: 'not_acknowledged',
-                    reason: unansweredReason
-                });
+                const syncServiceSid = context.SYNC_SERVICE_SID;
+                const maxLevel1Attempts = asPositiveInt(firstNonEmpty(context.MAX_LEVEL1_ATTEMPTS, '3'), 3);
+                const maxLevel2Attempts = asPositiveInt(firstNonEmpty(context.MAX_LEVEL2_ATTEMPTS, '3'), 3);
+                const retryDelayMinutes = asPositiveInt(firstNonEmpty(context.RETRY_DELAY_MINUTES, '30'), 30);
+                const maxAttemptsForCurrentLevel = String(level) === '1' ? maxLevel1Attempts : maxLevel2Attempts;
+
+                if (attempt < maxAttemptsForCurrentLevel) {
+                    const scheduled = await scheduleRetry({
+                        client, syncServiceSid, problemId,
+                        level, attempt, toNumber,
+                        delayMinutes: retryDelayMinutes
+                    });
+                    console.log(`[RETRY_ACK] ${scheduled ? 'Scheduled' : 'Already scheduled'}: L${level} retry ${attempt + 1} in ${retryDelayMinutes} min`);
+                    escalationResult = { escalated: false, reason: 'retry_scheduled' };
+                } else if (String(level) === '1' && level2List[0]) {
+                    console.log(`[RETRY_ACK] Level 1 exhausted → escalating to Level 2`);
+                    escalationResult = await escalateFromLevel({
+                        currentLevel: level,
+                        currentAttempt: attempt,
+                        currentLevelIndex: levelIndex,
+                        callStatus: 'not_acknowledged',
+                        reason: 'max_level1_attempts_reached_ack'
+                    });
+                } else {
+                    console.log(`[RETRY_ACK] Level ${level} exhausted → incident closed`);
+                    escalationResult = { escalated: false, reason: 'max_attempts_all_levels' };
+                }
             }
 
             let unansweredMessage = 'No recibimos una confirmación válida. La llamada será considerada como no atendida.';
@@ -3360,7 +3562,30 @@ exports.handler = async function (context, event, callback) {
             }
         });
 
+        
+        // SIMPLIFIED DEDUPLICATION: Check if we already sent an SMS for this problemId
+        if (smsFromNumber && problemId && problemId !== 'unknown') {
+            try {
+                const initialLevelForCheck = String(payload.initialLevel || payload.routingLevel || '').trim() === '2' ? '2' : '1';
+                const listForCheck = initialLevelForCheck === '2' ? level2List : level1List;
+                const numberForCheck = listForCheck[0];
+                
+                if (numberForCheck) {
+                    const recentSms = await client.messages.list({ to: numberForCheck, limit: 10 });
+                    const alreadyProcessed = recentSms.some(msg => msg.body && msg.body.includes(`ID: ${problemId}`));
+                    if (alreadyProcessed) {
+                        const skipReason = `Incident ${problemId} already processed (found in SMS history). Ignoring Dynatrace retry.`;
+                        console.log(skipReason);
+                        return callback(null, skipReason);
+                    }
+                }
+            } catch (e) {
+                console.log(`Failed to check SMS history for deduplication: ${e.message}`);
+            }
+        }
+        
         const requestedInitialLevel = String(payload.initialLevel || payload.routingLevel || '').trim();
+
         const initialLevel = requestedInitialLevel === '2' ? '2' : '1';
         const initialList = initialLevel === '2' ? level2List : level1List;
         let toNumber = initialList[0];

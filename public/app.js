@@ -118,6 +118,8 @@ const getFilteredIncidents = () => {
       incident.incident_status,
       incident.incident_severity,
       incident.called_user_name,
+      incident.called_user && incident.called_user.area && incident.called_user.area.name,
+      incident.called_user && incident.called_user.area && incident.called_user.area.code,
       incident.called_number,
       incident.problem_id,
       incident.cause_name,
@@ -271,6 +273,7 @@ const renderIncidents = () => {
       const causeNameRaw = escapeHtml(incident.cause_name || '');
       const affectedEntityRaw = escapeHtml(incident.affected_entity || '');
       const incidentAreaRaw = escapeHtml(incident.incident_area || '');
+      const specialistAreaRaw = escapeHtml((incident.called_user && incident.called_user.area && incident.called_user.area.name) || '');
       const adminAction = adminCanDelete
         ? `<button class="danger incident-delete-btn" type="button" data-id="${incident.id}">Eliminar</button>`
         : '';
@@ -285,6 +288,7 @@ const renderIncidents = () => {
           <div class="incident-meta">
             Estado: ${status}<br />
             ${incidentAreaRaw ? `Area: <strong>${incidentAreaRaw}</strong><br />` : ''}
+            ${specialistAreaRaw ? `Area especialista: <strong>${specialistAreaRaw}</strong><br />` : ''}
             ${causeNameRaw ? `Causa raíz: <strong>${causeNameRaw}</strong><br />` : ''}
             ${affectedEntityRaw ? `Impactado: <strong>${affectedEntityRaw}</strong><br />` : ''}
             Numero llamado: ${calledNumber}<br />
@@ -525,20 +529,10 @@ const connectRealtime = async () => {
         schema: 'public',
         table: 'incidents'
       },
-      (payload) => {
-        if (payload.eventType === 'INSERT') {
-          state.incidents = [payload.new, ...state.incidents].slice(0, 200);
-        }
-
-        if (payload.eventType === 'UPDATE') {
-          state.incidents = state.incidents.map((incident) => (incident.id === payload.new.id ? payload.new : incident));
-        }
-
-        if (payload.eventType === 'DELETE') {
-          state.incidents = state.incidents.filter((incident) => incident.id !== payload.old.id);
-        }
-
-        renderIncidents();
+      () => {
+        fetchIncidents().catch((error) => {
+          console.log(`Realtime refresh failed: ${error.message}`);
+        });
       }
     )
     .subscribe();

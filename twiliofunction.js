@@ -956,7 +956,7 @@ const DEFAULT_AREA_TAG_GROUPS = Object.freeze({
         'custom:call_turno_observabilidad',
         'call_turno_observabilidad'
     ],
-    'Area Programacion': [
+    'Area Digital': [
         'custom_programacion',
         'custom:_programacion',
         'call_turno_progra'
@@ -3384,6 +3384,24 @@ exports.handler = async function (context, event, callback) {
 
             const amdClassification = classifyAmdResult(answeredBy);
             const ackConfirmed = ackConfirmedFromStatusCallback || ackConfirmedFromMemory;
+            const callbackAckSyncKey = `ack_sync:${problemId}:${callSid || `${level}:${attempt}:${levelIndex}`}`;
+            const callbackCalledNumber = firstNonEmpty(event.To, payload.to, payload.To, toNumber);
+
+            if (ackConfirmed && acquireFlowLock(callbackAckSyncKey, flowLockTtlMs)) {
+                try {
+                    await postIncidentAckToApp({
+                        appWebhookUrl,
+                        appWebhookSecret,
+                        problemId,
+                        calledNumber: callbackCalledNumber,
+                        incidentAttended: true,
+                        incidentStatus: 'ACKNOWLEDGED'
+                    });
+                } catch (appError) {
+                    console.log(`Monitoring app callback ack sync error (non-blocking): ${appError.message}`);
+                }
+            }
+
             const callbackEscalationCandidate = requireDtmfAck
                 ? shouldRetryCall(callStatus)
                 : shouldContinueEscalation(callStatus, answeredBy);

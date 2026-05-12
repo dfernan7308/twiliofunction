@@ -119,20 +119,23 @@ exports.handler = async (event) => {
       }
 
       let latestIncident = null;
+      let byProblem = [];
 
       if (problemId) {
-        const { data: byProblem, error: byProblemError } = await supabase
+        const { data: byProblemRows, error: byProblemError } = await supabase
           .from('incidents')
           .select('id, called_number')
           .eq('problem_id', problemId)
           .order('created_at', { ascending: false })
-          .limit(10);
+          .limit(25);
 
         if (byProblemError) {
           return json(500, { error: 'Failed to locate incident for ack update', details: byProblemError.message });
         }
 
-        if (Array.isArray(byProblem) && byProblem.length) {
+        byProblem = Array.isArray(byProblemRows) ? byProblemRows : [];
+
+        if (byProblem.length) {
           if (calledNumberNormalized) {
             latestIncident = byProblem.find((item) => normalizePhone(item.called_number) === calledNumberNormalized) || byProblem[0];
           } else {
@@ -167,18 +170,47 @@ exports.handler = async (event) => {
         incident_status: incidentStatus
       };
 
-      const { data: updated, error: updateError } = await supabase
+      // If there are duplicate rows for the same problem (retries/race conditions),
+      // propagate positive ACK so the UI doesn't keep stale "No atendida" rows.
+      const targetIncidentIds = (() => {
+        if (!incidentAttended) {
+          return [latestIncident.id];
+        }
+
+        if (!problemId || !byProblem.length) {
+          return [latestIncident.id];
+        }
+
+        if (!calledNumberNormalized) {
+          return byProblem.map((item) => item.id);
+        }
+
+        const sameNumberIds = byProblem
+          .filter((item) => normalizePhone(item.called_number) === calledNumberNormalized)
+          .map((item) => item.id);
+
+        return sameNumberIds.length ? sameNumberIds : [latestIncident.id];
+      })();
+
+      const { data: updatedRows, error: updateError } = await supabase
         .from('incidents')
         .update(updatePayload)
-        .eq('id', latestIncident.id)
+        .in('id', targetIncidentIds)
         .select('id, problem_id, incident_title, incident_status, incident_severity, incident_description, called_number, called_user_id, called_user_name, incident_attended, incident_attended_at, cause_name, affected_entity, created_at')
-        .single();
+        ;
 
       if (updateError) {
         return json(500, { error: 'Failed to update incident acknowledgment', details: updateError.message });
       }
 
-      return json(200, { incident: updated, updated: true });
+      const updatedList = Array.isArray(updatedRows) ? updatedRows : [];
+      const updated = updatedList.find((item) => String(item.id) === String(latestIncident.id)) || updatedList[0] || null;
+
+      return json(200, {
+        incident: updated,
+        updated: true,
+        updatedCount: updatedList.length
+      });
     }
 
     if (eventType === 'escalation_reserve') {

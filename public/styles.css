@@ -192,6 +192,17 @@ button.danger {
   gap: 10px;
 }
 
+.admin-tabs {
+  display: flex;
+  gap: 10px;
+}
+
+.admin-tabs button.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -206,6 +217,10 @@ button.danger {
   display: grid;
   grid-template-columns: 2.8fr 1.2fr;
   gap: 16px;
+}
+
+.grid.users-only-layout {
+  grid-template-columns: 1fr;
 }
 
 .incidents-panel {

@@ -1828,8 +1828,79 @@ const parseOncallRoster = (value) => {
     try {
         return JSON.parse(String(value));
     } catch (error) {
-        throw new Error('Invalid ONCALL_ROSTER JSON. Expected format: {"level1":["+569..."],"level2":["+569..."]}');
+        throw new Error('Invalid ONCALL_ROSTER JSON. Expected legacy format {"level1":["+569..."],"level2":["+569..."]} or area format {"default":{"level1":[],"level2":[]},"areas":{"AREA_SRE":{"level1":[],"level2":[]}}}.');
     }
+};
+
+const normalizeAreaRosterKey = (value) => String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+const isRosterLevelObject = (value) => Boolean(
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (Object.prototype.hasOwnProperty.call(value, 'level1') || Object.prototype.hasOwnProperty.call(value, 'level2'))
+);
+
+const getRosterByArea = (roster, incidentArea) => {
+    if (!roster || typeof roster !== 'object' || Array.isArray(roster)) {
+        return { level1: [], level2: [], source: 'missing_roster' };
+    }
+
+    if (isRosterLevelObject(roster)) {
+        return {
+            level1: normalizeList(roster.level1),
+            level2: normalizeList(roster.level2),
+            source: 'legacy_root'
+        };
+    }
+
+    const normalizedAreaKey = normalizeAreaRosterKey(incidentArea);
+    const areasMap = roster.areas && typeof roster.areas === 'object' && !Array.isArray(roster.areas)
+        ? roster.areas
+        : {};
+
+    const lookupCandidates = [
+        normalizedAreaKey,
+        normalizeAreaRosterKey(incidentArea).replace(/^AREA_/, '')
+    ].filter(Boolean);
+
+    const areaEntries = [
+        ...Object.entries(areasMap),
+        ...Object.entries(roster).filter(([key, value]) => key !== 'default' && key !== 'areas' && isRosterLevelObject(value))
+    ];
+
+    for (const [areaKey, areaValue] of areaEntries) {
+        const normalizedKey = normalizeAreaRosterKey(areaKey);
+        if (!normalizedKey || !lookupCandidates.includes(normalizedKey)) {
+            continue;
+        }
+
+        if (!isRosterLevelObject(areaValue)) {
+            continue;
+        }
+
+        return {
+            level1: normalizeList(areaValue.level1),
+            level2: normalizeList(areaValue.level2),
+            source: `area:${areaKey}`
+        };
+    }
+
+    const defaultRoster = roster.default;
+    if (isRosterLevelObject(defaultRoster)) {
+        return {
+            level1: normalizeList(defaultRoster.level1),
+            level2: normalizeList(defaultRoster.level2),
+            source: 'default'
+        };
+    }
+
+    return { level1: [], level2: [], source: 'not_found' };
 };
 
 const resolveSpecialistName = (context, payload, phoneNumber) => {
@@ -2352,11 +2423,9 @@ exports.handler = async function (context, event, callback) {
 
     const eventLevel1List = normalizeList(payload.level1);
     const eventLevel2List = normalizeList(payload.level2);
-    const rosterLevel1List = normalizeList(roster && roster.level1);
-    const rosterLevel2List = normalizeList(roster && roster.level2);
-
-    const level1List = eventLevel1List.length ? eventLevel1List : rosterLevel1List;
-    const level2List = eventLevel2List.length ? eventLevel2List : rosterLevel2List;
+    let level1List = [];
+    let level2List = [];
+    let rosterResolutionSource = 'pending';
     const skipDynatraceLookup = shouldSkipDynatraceLookupForProblemId(context, payload, problemId);
     const dynatraceIdentitySignalsPresent = hasDynatraceIdentitySignals(payload);
     const isSmokeLikeProblemId = shouldSkipDynatraceLookupForProblemId(context, payload, problemId);
@@ -2449,6 +2518,15 @@ exports.handler = async function (context, event, callback) {
     }
 
     const incidentSummary = buildIncidentSummary(payload, problemId);
+    const areaScopedRoster = getRosterByArea(roster, incidentSummary.incidentArea);
+    const fallbackRootRosterLevel1 = normalizeList(roster && roster.level1);
+    const fallbackRootRosterLevel2 = normalizeList(roster && roster.level2);
+    const rosterLevel1List = areaScopedRoster.level1.length ? areaScopedRoster.level1 : fallbackRootRosterLevel1;
+    const rosterLevel2List = areaScopedRoster.level2.length ? areaScopedRoster.level2 : fallbackRootRosterLevel2;
+    level1List = eventLevel1List.length ? eventLevel1List : rosterLevel1List;
+    level2List = eventLevel2List.length ? eventLevel2List : rosterLevel2List;
+    rosterResolutionSource = areaScopedRoster.source;
+
     const message = payload.message || incidentSummary.voiceMessage;
     const level2Message = payload.level2Message || `Escalamiento automático. ${incidentSummary.voiceMessage}`;
     const smsMessage = payload.smsMessage || incidentSummary.smsMessage;
@@ -2468,6 +2546,9 @@ exports.handler = async function (context, event, callback) {
         console.log('Dynatrace area tag groups:', JSON.stringify(getAreaTagGroups(payload)));
         console.log('Dynatrace area matches:', JSON.stringify(getAreaTagMatches(payload)));
         console.log('Dynatrace resolved area:', getResolvedIncidentArea(payload) || '[empty]');
+        console.log('Oncall roster resolution source:', rosterResolutionSource);
+        console.log('Oncall roster level1 selected:', JSON.stringify(level1List));
+        console.log('Oncall roster level2 selected:', JSON.stringify(level2List));
         console.log('Teams webhook configured:', Boolean(teamsWebhookUrl));
         console.log('Teams webhook length:', teamsWebhookUrl ? teamsWebhookUrl.length : 0);
         console.log('Dynatrace resolved cause:', getRootCauseValue(payload) || '[empty]');
@@ -2490,7 +2571,10 @@ exports.handler = async function (context, event, callback) {
         priority: incidentSummary.priority,
         causeName: incidentSummary.causeName || incidentSummary.serviceName,
         affectedEntity: incidentSummary.affectedEntity,
-        incidentArea: incidentSummary.incidentArea || ''
+        incidentArea: incidentSummary.incidentArea || '',
+        rosterSource: rosterResolutionSource,
+        level1Count: level1List.length,
+        level2Count: level2List.length
     }));
 
     if (!fromNumber || !functionBaseUrl) {

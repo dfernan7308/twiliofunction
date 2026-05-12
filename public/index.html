@@ -53,8 +53,13 @@
           </div>
         </header>
 
-        <section class="grid">
-          <article class="card incidents-panel">
+        <section id="adminTabs" class="card admin-tabs hidden">
+          <button id="tabIncidentsBtn" type="button" class="ghost active">Incidentes</button>
+          <button id="tabUsersBtn" type="button" class="ghost">Usuarios</button>
+        </section>
+
+        <section id="appGrid" class="grid">
+          <article id="incidentsPanelCard" class="card incidents-panel">
             <h3>Incidentes</h3>
             <p class="hint">Webhook de entrada: /api/webhook-incident</p>
             <section class="incidents-toolbar">
@@ -147,23 +152,6 @@
             <p id="adminError" class="error"></p>
             <p class="hint">Puedes editar o eliminar usuarios existentes.</p>
             <ul id="userList" class="user-list"></ul>
-
-            <h3>Administración de Areas</h3>
-            <form id="createAreaForm" class="stack compact">
-              <label>Nombre del area <input type="text" name="name" required /></label>
-              <label>Código del area <input type="text" name="code" placeholder="SRE" required /></label>
-              <label>Tags (uno por linea o separados por coma)
-                <textarea name="tags" rows="4" placeholder="custom_call_turno_observabilidad&#10;custom:call_turno_observabilidad"></textarea>
-              </label>
-              <label class="inline-option">
-                <input type="checkbox" name="is_active" checked />
-                Activa
-              </label>
-              <button type="submit">Crear area</button>
-            </form>
-            <p id="areaError" class="error"></p>
-            <p class="hint">Gestiona tags por área para enrutar incidencias de forma escalable.</p>
-            <ul id="areaList" class="user-list"></ul>
           </aside>
 
           <aside id="userInfoPanel" class="card hidden">

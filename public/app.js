@@ -6,6 +6,7 @@ const state = {
   incidents: [],
   users: [],
   areas: [],
+  adminViewTab: 'incidents',
   supabase: null,
   realtimeChannel: null,
   incidentView: {
@@ -28,6 +29,11 @@ const elements = {
   loginError: document.getElementById('loginError'),
   sessionInfo: document.getElementById('sessionInfo'),
   logoutBtn: document.getElementById('logoutBtn'),
+  adminTabs: document.getElementById('adminTabs'),
+  tabIncidentsBtn: document.getElementById('tabIncidentsBtn'),
+  tabUsersBtn: document.getElementById('tabUsersBtn'),
+  appGrid: document.getElementById('appGrid'),
+  incidentsPanelCard: document.getElementById('incidentsPanelCard'),
   incidentList: document.getElementById('incidentList'),
   incidentSearchInput: document.getElementById('incidentSearchInput'),
   incidentGroupBy: document.getElementById('incidentGroupBy'),
@@ -46,11 +52,8 @@ const elements = {
   userInfoPanel: document.getElementById('userInfoPanel'),
   createUserForm: document.getElementById('createUserForm'),
   createUserAreaSelect: document.getElementById('createUserAreaSelect'),
-  createAreaForm: document.getElementById('createAreaForm'),
   adminError: document.getElementById('adminError'),
-  areaError: document.getElementById('areaError'),
   userList: document.getElementById('userList'),
-  areaList: document.getElementById('areaList'),
   userInfoList: document.getElementById('userInfoList')
 };
 
@@ -299,14 +302,6 @@ const renderIncidents = () => {
   elements.incidentNextPage.disabled = page >= totalPages;
 };
 
-const normalizeTagsInput = (value) => {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item || '').trim()).filter(Boolean).join('\n');
-  }
-
-  return String(value || '').trim();
-};
-
 const buildAreaOptionsHtml = (selectedAreaId = '') => {
   const options = (state.areas || [])
     .filter((area) => area.is_active || String(area.id) === String(selectedAreaId || ''))
@@ -329,39 +324,6 @@ const renderCreateUserAreaOptions = () => {
   }
 
   elements.createUserAreaSelect.innerHTML = buildAreaOptionsHtml('');
-};
-
-const renderAreas = () => {
-  if (!elements.areaList) {
-    return;
-  }
-
-  if (!state.areas.length) {
-    elements.areaList.innerHTML = '<li class="user-item">No hay areas registradas.</li>';
-    return;
-  }
-
-  elements.areaList.innerHTML = state.areas
-    .map((area) => `
-      <li class="user-item">
-        <form class="stack compact area-edit-form" data-id="${area.id}">
-          <label>Nombre del area <input type="text" name="name" value="${escapeHtml(area.name || '')}" required /></label>
-          <label>Codigo <input type="text" name="code" value="${escapeHtml(area.code || '')}" required /></label>
-          <label>Tags (uno por linea o separados por coma)
-            <textarea name="tags" rows="3" placeholder="custom_tag_a\ncustom:tag_b">${escapeHtml(normalizeTagsInput(area.tags))}</textarea>
-          </label>
-          <label class="inline-option">
-            <input type="checkbox" name="is_active" ${area.is_active ? 'checked' : ''} />
-            Activa
-          </label>
-          <div class="item-actions">
-            <button type="submit">Guardar area</button>
-            <button type="button" class="danger area-delete-btn" data-id="${area.id}">Eliminar</button>
-          </div>
-        </form>
-      </li>
-    `)
-    .join('');
 };
 
 const renderUsers = () => {
@@ -454,7 +416,7 @@ const fetchAreas = async () => {
   const result = await apiFetch('/api/areas-list');
   state.areas = result.areas || [];
   renderCreateUserAreaOptions();
-  renderAreas();
+  renderUsers();
 };
 
 const disconnectRealtime = () => {
@@ -502,6 +464,39 @@ const connectRealtime = async () => {
     .subscribe();
 };
 
+const setAdminViewTab = (tab) => {
+  const normalizedTab = tab === 'users' ? 'users' : 'incidents';
+  state.adminViewTab = normalizedTab;
+
+  if (!isAdmin()) {
+    if (elements.adminTabs) {
+      elements.adminTabs.classList.add('hidden');
+    }
+    elements.incidentsPanelCard.classList.remove('hidden');
+    elements.adminPanel.classList.add('hidden');
+    return;
+  }
+
+  if (elements.adminTabs) {
+    elements.adminTabs.classList.remove('hidden');
+  }
+
+  const showUsers = normalizedTab === 'users';
+  elements.incidentsPanelCard.classList.toggle('hidden', showUsers);
+  elements.adminPanel.classList.toggle('hidden', !showUsers);
+  if (elements.appGrid) {
+    elements.appGrid.classList.toggle('users-only-layout', showUsers);
+  }
+
+  if (elements.tabIncidentsBtn) {
+    elements.tabIncidentsBtn.classList.toggle('active', !showUsers);
+  }
+
+  if (elements.tabUsersBtn) {
+    elements.tabUsersBtn.classList.toggle('active', showUsers);
+  }
+};
+
 const enterApp = async () => {
   elements.loginCard.classList.add('hidden');
   elements.appPanel.classList.remove('hidden');
@@ -510,14 +505,15 @@ const enterApp = async () => {
   elements.sessionInfo.textContent = `${displayIdentity} (${state.user.role})`;
 
   const adminView = isAdmin();
-  elements.adminPanel.classList.toggle('hidden', !adminView);
   elements.userInfoPanel.classList.toggle('hidden', adminView);
 
   await fetchIncidents();
   if (adminView) {
     await fetchAreas();
     await fetchUsers();
+    setAdminViewTab(state.adminViewTab || 'incidents');
   } else {
+    setAdminViewTab('incidents');
     renderCurrentUserInfo();
   }
 
@@ -531,6 +527,7 @@ const logout = () => {
   state.incidents = [];
   state.users = [];
   state.areas = [];
+  state.adminViewTab = 'incidents';
   localStorage.removeItem('appToken');
   localStorage.removeItem('appUser');
 
@@ -539,6 +536,9 @@ const logout = () => {
   elements.loginForm.reset();
   elements.loginError.textContent = '';
   elements.userInfoList.innerHTML = '';
+  if (elements.adminTabs) {
+    elements.adminTabs.classList.add('hidden');
+  }
   state.incidentView.page = 1;
 };
 
@@ -648,88 +648,6 @@ elements.userList.addEventListener('submit', async (event) => {
   }
 });
 
-elements.createAreaForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  elements.areaError.textContent = '';
-
-  const formData = new FormData(elements.createAreaForm);
-  const payload = {
-    name: String(formData.get('name') || '').trim(),
-    code: String(formData.get('code') || '').trim(),
-    tags: String(formData.get('tags') || ''),
-    is_active: formData.get('is_active') === 'on'
-  };
-
-  try {
-    await apiFetch('/api/areas-create', {
-      method: 'POST',
-      body: JSON.stringify(payload)
-    });
-
-    elements.createAreaForm.reset();
-    await fetchAreas();
-    await fetchUsers();
-  } catch (error) {
-    elements.areaError.textContent = error.message;
-  }
-});
-
-elements.areaList.addEventListener('submit', async (event) => {
-  const form = event.target.closest('.area-edit-form');
-  if (!form) {
-    return;
-  }
-
-  event.preventDefault();
-  elements.areaError.textContent = '';
-
-  const formData = new FormData(form);
-  const payload = {
-    id: form.dataset.id,
-    name: String(formData.get('name') || '').trim(),
-    code: String(formData.get('code') || '').trim(),
-    tags: String(formData.get('tags') || ''),
-    is_active: formData.get('is_active') === 'on'
-  };
-
-  try {
-    await apiFetch('/api/areas-update', {
-      method: 'POST',
-      body: JSON.stringify(payload)
-    });
-
-    await fetchAreas();
-    await fetchUsers();
-  } catch (error) {
-    elements.areaError.textContent = error.message;
-  }
-});
-
-elements.areaList.addEventListener('click', async (event) => {
-  const deleteButton = event.target.closest('.area-delete-btn');
-  if (!deleteButton) {
-    return;
-  }
-
-  if (!window.confirm('Se eliminará el area seleccionada. ¿Continuar?')) {
-    return;
-  }
-
-  elements.areaError.textContent = '';
-
-  try {
-    await apiFetch('/api/areas-delete', {
-      method: 'POST',
-      body: JSON.stringify({ id: deleteButton.dataset.id })
-    });
-
-    await fetchAreas();
-    await fetchUsers();
-  } catch (error) {
-    elements.areaError.textContent = error.message;
-  }
-});
-
 elements.userList.addEventListener('click', async (event) => {
   const deleteButton = event.target.closest('.user-delete-btn');
   if (!deleteButton) {
@@ -800,6 +718,14 @@ elements.incidentNextPage.addEventListener('click', () => {
   state.incidentView.page += 1;
   renderIncidents();
 });
+
+if (elements.tabIncidentsBtn) {
+  elements.tabIncidentsBtn.addEventListener('click', () => setAdminViewTab('incidents'));
+}
+
+if (elements.tabUsersBtn) {
+  elements.tabUsersBtn.addEventListener('click', () => setAdminViewTab('users'));
+}
 
 elements.logoutBtn.addEventListener('click', logout);
 

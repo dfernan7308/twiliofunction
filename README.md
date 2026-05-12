@@ -115,10 +115,10 @@ Flujo esperado:
 
 ## Flujo de áreas y tags
 
-1. Admin crea áreas desde el panel (por ejemplo: Area SRE, Area Programacion) y define tags por área.
-2. Cada usuario debe quedar asociado a un `area_id`.
-3. `twiliofunction.js` detecta el área del incidente según los tags entrantes (`entityTags`) y envía `incident_area` al webhook.
-4. El webhook persiste `incident_area` y, cuando existe contexto de área, prioriza vincular usuario por número dentro de esa área.
+1. `twiliofunction.js` detecta el área del incidente según `entityTags` (usando `AREA_TAG_GROUPS_JSON` o defaults internos).
+2. La selección del especialista que se llama la resuelve `ONCALL_ROSTER`.
+3. El panel web mantiene foco en administración de usuarios (no en edición de tags/áreas).
+4. El webhook persiste `incident_area` y prioriza vincular usuario por número dentro de esa área cuando el área está disponible.
 
 Ejemplo de `AREA_TAG_GROUPS_JSON`:
 
@@ -136,6 +136,32 @@ Ejemplo de `AREA_TAG_GROUPS_JSON`:
   ]
 }
 ```
+
+Ejemplo recomendado de `ONCALL_ROSTER` por área:
+
+```json
+{
+  "default": {
+    "level1": ["+56911111111"],
+    "level2": ["+56922222222"]
+  },
+  "areas": {
+    "AREA_SRE": {
+      "level1": ["+56933333333"],
+      "level2": ["+56944444444"]
+    },
+    "AREA_PROGRAMACION": {
+      "level1": ["+56955555555"],
+      "level2": ["+56966666666"]
+    }
+  }
+}
+```
+
+Notas:
+
+- También sigue soportado el formato legacy: `{ "level1": [...], "level2": [...] }`.
+- Si llega `payload.level1` o `payload.level2`, eso tiene prioridad sobre `ONCALL_ROSTER`.
 
 ## Deploy en Netlify
 

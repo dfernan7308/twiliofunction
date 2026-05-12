@@ -9,6 +9,9 @@ const state = {
   adminViewTab: 'incidents',
   supabase: null,
   realtimeChannel: null,
+  userView: {
+    search: ''
+  },
   incidentView: {
     search: '',
     groupBy: 'none',
@@ -32,6 +35,7 @@ const elements = {
   adminTabs: document.getElementById('adminTabs'),
   tabIncidentsBtn: document.getElementById('tabIncidentsBtn'),
   tabUsersBtn: document.getElementById('tabUsersBtn'),
+  tabAreasBtn: document.getElementById('tabAreasBtn'),
   appGrid: document.getElementById('appGrid'),
   incidentsPanelCard: document.getElementById('incidentsPanelCard'),
   incidentList: document.getElementById('incidentList'),
@@ -49,11 +53,16 @@ const elements = {
   incidentPageIndicator: document.getElementById('incidentPageIndicator'),
   incidentPaginationInfo: document.getElementById('incidentPaginationInfo'),
   adminPanel: document.getElementById('adminPanel'),
+  areasPanel: document.getElementById('areasPanel'),
   userInfoPanel: document.getElementById('userInfoPanel'),
   createUserForm: document.getElementById('createUserForm'),
   createUserAreaSelect: document.getElementById('createUserAreaSelect'),
+  userSearchInput: document.getElementById('userSearchInput'),
+  createAreaForm: document.getElementById('createAreaForm'),
   adminError: document.getElementById('adminError'),
+  areaError: document.getElementById('areaError'),
   userList: document.getElementById('userList'),
+  areaList: document.getElementById('areaList'),
   userInfoList: document.getElementById('userInfoList')
 };
 
@@ -318,6 +327,14 @@ const buildAreaOptionsHtml = (selectedAreaId = '') => {
   return ['<option value="">Selecciona un area</option>', ...options].join('');
 };
 
+const normalizeTagsInput = (value) => {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean).join('\n');
+  }
+
+  return String(value || '').trim();
+};
+
 const renderCreateUserAreaOptions = () => {
   if (!elements.createUserAreaSelect) {
     return;
@@ -326,13 +343,42 @@ const renderCreateUserAreaOptions = () => {
   elements.createUserAreaSelect.innerHTML = buildAreaOptionsHtml('');
 };
 
+const getFilteredUsers = () => {
+  const search = normalizeFilterText(state.userView.search);
+  if (!search) {
+    return state.users;
+  }
+
+  return state.users.filter((user) => {
+    const areaName = user.area && user.area.name ? user.area.name : '';
+    const areaCode = user.area && user.area.code ? user.area.code : '';
+    const searchable = [
+      user.username,
+      user.email,
+      user.phone,
+      user.role,
+      areaName,
+      areaCode,
+      user.is_active ? 'activo' : 'inactivo'
+    ].map((value) => normalizeFilterText(value)).join(' ');
+
+    return searchable.includes(search);
+  });
+};
+
 const renderUsers = () => {
   if (!state.users.length) {
     elements.userList.innerHTML = '<li class="user-item">No hay usuarios registrados.</li>';
     return;
   }
 
-  elements.userList.innerHTML = state.users
+  const usersToRender = getFilteredUsers();
+  if (!usersToRender.length) {
+    elements.userList.innerHTML = '<li class="user-item">No hay usuarios que coincidan con la búsqueda.</li>';
+    return;
+  }
+
+  elements.userList.innerHTML = usersToRender
     .map(
       (user) => `
       <li class="user-item">
@@ -368,6 +414,39 @@ const renderUsers = () => {
       </li>
     `
     )
+    .join('');
+};
+
+const renderAreas = () => {
+  if (!elements.areaList) {
+    return;
+  }
+
+  if (!state.areas.length) {
+    elements.areaList.innerHTML = '<li class="user-item">No hay areas registradas.</li>';
+    return;
+  }
+
+  elements.areaList.innerHTML = state.areas
+    .map((area) => `
+      <li class="user-item">
+        <form class="stack compact area-edit-form" data-id="${area.id}">
+          <label>Nombre del area <input type="text" name="name" value="${escapeHtml(area.name || '')}" required /></label>
+          <label>Grupo/Codigo <input type="text" name="code" value="${escapeHtml(area.code || '')}" required /></label>
+          <label>Tags customizadas
+            <textarea name="tags" rows="4" placeholder="custom_tag_a\ncustom:tag_b">${escapeHtml(normalizeTagsInput(area.tags))}</textarea>
+          </label>
+          <label class="inline-option">
+            <input type="checkbox" name="is_active" ${area.is_active ? 'checked' : ''} />
+            Activa
+          </label>
+          <div class="item-actions">
+            <button type="submit">Guardar area</button>
+            <button type="button" class="danger area-delete-btn" data-id="${area.id}">Eliminar</button>
+          </div>
+        </form>
+      </li>
+    `)
     .join('');
 };
 
@@ -417,6 +496,7 @@ const fetchAreas = async () => {
   state.areas = result.areas || [];
   renderCreateUserAreaOptions();
   renderUsers();
+  renderAreas();
 };
 
 const disconnectRealtime = () => {
@@ -465,7 +545,7 @@ const connectRealtime = async () => {
 };
 
 const setAdminViewTab = (tab) => {
-  const normalizedTab = tab === 'users' ? 'users' : 'incidents';
+  const normalizedTab = ['incidents', 'users', 'areas'].includes(tab) ? tab : 'incidents';
   state.adminViewTab = normalizedTab;
 
   if (!isAdmin()) {
@@ -474,6 +554,12 @@ const setAdminViewTab = (tab) => {
     }
     elements.incidentsPanelCard.classList.remove('hidden');
     elements.adminPanel.classList.add('hidden');
+    if (elements.areasPanel) {
+      elements.areasPanel.classList.add('hidden');
+    }
+    if (elements.appGrid) {
+      elements.appGrid.classList.remove('incidents-only-layout', 'users-only-layout', 'areas-only-layout');
+    }
     return;
   }
 
@@ -481,19 +567,32 @@ const setAdminViewTab = (tab) => {
     elements.adminTabs.classList.remove('hidden');
   }
 
+  const showIncidents = normalizedTab === 'incidents';
   const showUsers = normalizedTab === 'users';
-  elements.incidentsPanelCard.classList.toggle('hidden', showUsers);
+  const showAreas = normalizedTab === 'areas';
+
+  elements.incidentsPanelCard.classList.toggle('hidden', !showIncidents);
   elements.adminPanel.classList.toggle('hidden', !showUsers);
+  if (elements.areasPanel) {
+    elements.areasPanel.classList.toggle('hidden', !showAreas);
+  }
+
   if (elements.appGrid) {
+    elements.appGrid.classList.toggle('incidents-only-layout', showIncidents);
     elements.appGrid.classList.toggle('users-only-layout', showUsers);
+    elements.appGrid.classList.toggle('areas-only-layout', showAreas);
   }
 
   if (elements.tabIncidentsBtn) {
-    elements.tabIncidentsBtn.classList.toggle('active', !showUsers);
+    elements.tabIncidentsBtn.classList.toggle('active', showIncidents);
   }
 
   if (elements.tabUsersBtn) {
     elements.tabUsersBtn.classList.toggle('active', showUsers);
+  }
+
+  if (elements.tabAreasBtn) {
+    elements.tabAreasBtn.classList.toggle('active', showAreas);
   }
 };
 
@@ -528,6 +627,7 @@ const logout = () => {
   state.users = [];
   state.areas = [];
   state.adminViewTab = 'incidents';
+  state.userView.search = '';
   localStorage.removeItem('appToken');
   localStorage.removeItem('appUser');
 
@@ -535,7 +635,18 @@ const logout = () => {
   elements.loginCard.classList.remove('hidden');
   elements.loginForm.reset();
   elements.loginError.textContent = '';
+  elements.adminError.textContent = '';
+  if (elements.areaError) {
+    elements.areaError.textContent = '';
+  }
+  if (elements.userSearchInput) {
+    elements.userSearchInput.value = '';
+  }
   elements.userInfoList.innerHTML = '';
+  elements.userList.innerHTML = '';
+  if (elements.areaList) {
+    elements.areaList.innerHTML = '';
+  }
   if (elements.adminTabs) {
     elements.adminTabs.classList.add('hidden');
   }
@@ -672,6 +783,105 @@ elements.userList.addEventListener('click', async (event) => {
   }
 });
 
+if (elements.createAreaForm) {
+  elements.createAreaForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (elements.areaError) {
+      elements.areaError.textContent = '';
+    }
+
+    const formData = new FormData(elements.createAreaForm);
+    const payload = {
+      name: String(formData.get('name') || '').trim(),
+      code: String(formData.get('code') || '').trim(),
+      tags: String(formData.get('tags') || ''),
+      is_active: formData.get('is_active') === 'on'
+    };
+
+    try {
+      await apiFetch('/api/areas-create', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+
+      elements.createAreaForm.reset();
+      const activeCheckbox = elements.createAreaForm.querySelector('input[name="is_active"]');
+      if (activeCheckbox) {
+        activeCheckbox.checked = true;
+      }
+      await fetchAreas();
+    } catch (error) {
+      if (elements.areaError) {
+        elements.areaError.textContent = error.message;
+      }
+    }
+  });
+}
+
+if (elements.areaList) {
+  elements.areaList.addEventListener('submit', async (event) => {
+    const form = event.target.closest('.area-edit-form');
+    if (!form) {
+      return;
+    }
+
+    event.preventDefault();
+    if (elements.areaError) {
+      elements.areaError.textContent = '';
+    }
+
+    const formData = new FormData(form);
+    const payload = {
+      id: form.dataset.id,
+      name: String(formData.get('name') || '').trim(),
+      code: String(formData.get('code') || '').trim(),
+      tags: String(formData.get('tags') || ''),
+      is_active: formData.get('is_active') === 'on'
+    };
+
+    try {
+      await apiFetch('/api/areas-update', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+
+      await fetchAreas();
+    } catch (error) {
+      if (elements.areaError) {
+        elements.areaError.textContent = error.message;
+      }
+    }
+  });
+
+  elements.areaList.addEventListener('click', async (event) => {
+    const deleteButton = event.target.closest('.area-delete-btn');
+    if (!deleteButton) {
+      return;
+    }
+
+    if (!window.confirm('Se eliminará el area seleccionada. ¿Continuar?')) {
+      return;
+    }
+
+    if (elements.areaError) {
+      elements.areaError.textContent = '';
+    }
+
+    try {
+      await apiFetch('/api/areas-delete', {
+        method: 'POST',
+        body: JSON.stringify({ id: deleteButton.dataset.id })
+      });
+
+      await fetchAreas();
+    } catch (error) {
+      if (elements.areaError) {
+        elements.areaError.textContent = error.message;
+      }
+    }
+  });
+}
+
 elements.incidentList.addEventListener('click', async (event) => {
   const deleteButton = event.target.closest('.incident-delete-btn');
   if (!deleteButton || !isAdmin()) {
@@ -705,6 +915,13 @@ elements.incidentToDate.addEventListener('change', onIncidentFilterChanged);
 elements.incidentPageSize.addEventListener('change', onIncidentFilterChanged);
 elements.incidentClearFilters.addEventListener('click', resetIncidentFilters);
 
+if (elements.userSearchInput) {
+  elements.userSearchInput.addEventListener('input', (event) => {
+    state.userView.search = String(event.target.value || '');
+    renderUsers();
+  });
+}
+
 elements.incidentPrevPage.addEventListener('click', () => {
   if (state.incidentView.page <= 1) {
     return;
@@ -725,6 +942,10 @@ if (elements.tabIncidentsBtn) {
 
 if (elements.tabUsersBtn) {
   elements.tabUsersBtn.addEventListener('click', () => setAdminViewTab('users'));
+}
+
+if (elements.tabAreasBtn) {
+  elements.tabAreasBtn.addEventListener('click', () => setAdminViewTab('areas'));
 }
 
 elements.logoutBtn.addEventListener('click', logout);

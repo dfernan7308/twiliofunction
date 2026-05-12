@@ -56,6 +56,7 @@
         <section id="adminTabs" class="card admin-tabs hidden">
           <button id="tabIncidentsBtn" type="button" class="ghost active">Incidentes</button>
           <button id="tabUsersBtn" type="button" class="ghost">Usuarios</button>
+          <button id="tabAreasBtn" type="button" class="ghost">Areas</button>
         </section>
 
         <section id="appGrid" class="grid">
@@ -150,8 +151,35 @@
               <button type="submit">Crear usuario</button>
             </form>
             <p id="adminError" class="error"></p>
+            <div class="user-toolbar">
+              <label>
+                Buscar usuario
+                <input id="userSearchInput" type="text" placeholder="Nombre, correo, telefono, rol, area..." />
+              </label>
+            </div>
             <p class="hint">Puedes editar o eliminar usuarios existentes.</p>
             <ul id="userList" class="user-list"></ul>
+          </aside>
+
+          <aside id="areasPanel" class="card hidden">
+            <h3>Administración de Areas</h3>
+            <p class="hint">Define grupos/códigos para hacer match visual con ONCALL_ROSTER (ejemplo: AREA_SRE).</p>
+            <form id="createAreaForm" class="stack compact">
+              <label>Nombre del area <input type="text" name="name" required /></label>
+              <label>Grupo/Codigo <input type="text" name="code" placeholder="AREA_SRE" required /></label>
+              <label>
+                Tags customizadas para match (una por linea o separadas por coma)
+                <textarea name="tags" rows="4" placeholder="custom_call_turno_observabilidad&#10;custom:call_turno_observabilidad"></textarea>
+              </label>
+              <label class="inline-option">
+                <input type="checkbox" name="is_active" checked />
+                Activa
+              </label>
+              <button type="submit">Crear area</button>
+            </form>
+            <p id="areaError" class="error"></p>
+            <p class="hint">Puedes editar o eliminar areas existentes.</p>
+            <ul id="areaList" class="user-list"></ul>
           </aside>
 
           <aside id="userInfoPanel" class="card hidden">

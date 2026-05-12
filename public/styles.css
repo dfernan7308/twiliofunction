@@ -195,6 +195,7 @@ button.danger {
 .admin-tabs {
   display: flex;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .admin-tabs button.active {
@@ -220,6 +221,11 @@ button.danger {
 }
 
 .grid.users-only-layout {
+  grid-template-columns: 1fr;
+}
+
+.grid.incidents-only-layout,
+.grid.areas-only-layout {
   grid-template-columns: 1fr;
 }
 
@@ -250,6 +256,15 @@ button.danger {
   padding: 0;
   display: grid;
   gap: 10px;
+}
+
+.user-toolbar {
+  margin-top: 14px;
+}
+
+#adminPanel h3 + form,
+#areasPanel h3 + form {
+  margin-top: 10px;
 }
 
 .incident-item,
@@ -344,14 +359,6 @@ button:disabled {
   }
 
   50% {
-
-  #adminPanel h3 + form {
-    margin-top: 10px;
-  }
-
-  #adminPanel h3:not(:first-child) {
-    margin-top: 22px;
-  }
     transform: translateY(-14px);
   }
 }

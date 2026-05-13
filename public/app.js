@@ -275,7 +275,7 @@ const renderIncidents = () => {
       const incidentAreaRaw = escapeHtml(incident.incident_area || '');
       const specialistAreaRaw = escapeHtml((incident.called_user && incident.called_user.area && incident.called_user.area.name) || '');
       const adminAction = adminCanDelete
-        ? `<button class="danger incident-delete-btn" type="button" data-id="${incident.id}">Eliminar</button>`
+        ? `<button class="danger incident-delete-btn" type="button" data-id="${incident.id}" data-problem-id="${escapeHtml(incident.problem_id || '')}">Eliminar</button>`
         : '';
 
       return `
@@ -888,12 +888,17 @@ elements.incidentList.addEventListener('click', async (event) => {
 
   try {
     const targetIncidentId = String(deleteButton.dataset.id || '').trim();
+    const targetProblemId = String(deleteButton.dataset.problemId || '').trim();
     await apiFetch('/api/incidents-delete', {
       method: 'POST',
-      body: JSON.stringify({ id: targetIncidentId })
+      body: JSON.stringify({ id: targetIncidentId, problem_id: targetProblemId })
     });
 
-    state.incidents = state.incidents.filter((incident) => String(incident.id) !== targetIncidentId);
+    if (targetProblemId) {
+      state.incidents = state.incidents.filter((incident) => String(incident.problem_id || '').toUpperCase() !== targetProblemId.toUpperCase());
+    } else {
+      state.incidents = state.incidents.filter((incident) => String(incident.id) !== targetIncidentId);
+    }
     renderIncidents();
   } catch (error) {
     elements.adminError.textContent = error.message;

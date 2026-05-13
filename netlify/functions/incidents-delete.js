@@ -18,23 +18,28 @@ exports.handler = async (event) => {
 
   try {
     const body = parseJsonBody(event);
-    const id = Number(body.id);
+    const id = String(body.id || '').trim();
 
-    if (!id || Number.isNaN(id)) {
+    if (!id || !/^-?\d+$/.test(id)) {
       return json(400, { error: 'id is required' });
     }
 
     const supabase = getSupabaseAdmin();
-    const { error } = await supabase
+    const { data: deletedRows, error } = await supabase
       .from('incidents')
       .delete()
-      .eq('id', id);
+      .eq('id', id)
+      .select('id');
 
     if (error) {
       return json(500, { error: 'Failed to delete incident', details: error.message });
     }
 
-    return json(200, { ok: true });
+    if (!Array.isArray(deletedRows) || !deletedRows.length) {
+      return json(404, { error: 'Incident not found' });
+    }
+
+    return json(200, { ok: true, deletedId: String(deletedRows[0].id) });
   } catch (error) {
     return json(500, { error: 'Unexpected error', details: error.message });
   }

@@ -887,12 +887,13 @@ elements.incidentList.addEventListener('click', async (event) => {
   }
 
   try {
+    const targetIncidentId = String(deleteButton.dataset.id || '').trim();
     await apiFetch('/api/incidents-delete', {
       method: 'POST',
-      body: JSON.stringify({ id: Number(deleteButton.dataset.id) })
+      body: JSON.stringify({ id: targetIncidentId })
     });
 
-    state.incidents = state.incidents.filter((incident) => incident.id !== Number(deleteButton.dataset.id));
+    state.incidents = state.incidents.filter((incident) => String(incident.id) !== targetIncidentId);
     renderIncidents();
   } catch (error) {
     elements.adminError.textContent = error.message;
